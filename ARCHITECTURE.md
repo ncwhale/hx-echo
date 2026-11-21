@@ -45,8 +45,7 @@ hx-echo/
 ├── schema.sql                  # D1 SQLite schema & indexes
 ├── LICENSE                     # MIT License
 ├── README.md                   # Project documentation & self-hosting guide
-├── docs/
-│   └── ARCHITECTURE.md         # This specification document
+├── ARCHITECTURE.md             # This file (detailed architecture & implementation spec)
 ├── src/
 │   └── lib.rs                  # Rust Worker entrypoint, router, D1 queries, HTML renderer
 └── hugo-example/
