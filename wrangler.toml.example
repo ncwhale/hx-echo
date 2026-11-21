@@ -1,0 +1,17 @@
+name = "hx-echo"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-01-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hx-echo-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Mount the same Worker across all mirror domains under /api/comments*
+routes = [
+  { pattern = "example.com/api/comments*", zone_name = "example.com" },
+  { pattern = "mirror.example.org/api/comments*", zone_name = "mirror.example.org" }
+]

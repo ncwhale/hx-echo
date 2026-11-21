@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL,                 -- Normalized pathname, e.g. "/posts/hello-world/"
+  parent_id INTEGER DEFAULT NULL,     -- NULL = top-level comment; integer = root comment id
+  reply_to_author TEXT DEFAULT NULL,  -- Target username for @mention display in nested threads
+  author TEXT NOT NULL,
+  content_html TEXT NOT NULL,         -- Sanitized HTML rendered from Markdown
+  created_at INTEGER NOT NULL,        -- Unix timestamp (seconds)
+  status INTEGER DEFAULT 1            -- 1 = published, 0 = pending/hidden
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_slug_id ON comments(slug, status, id);
