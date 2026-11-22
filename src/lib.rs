@@ -596,8 +596,9 @@ fn handle_preflight(
 }
 
 fn with_cors_headers(mut resp: Response, allowed_origin: Option<&str>) -> Result<Response> {
+    let headers = resp.headers_mut();
+    headers.set("Cache-Control", "no-store")?;
     if let Some(origin) = allowed_origin {
-        let headers = resp.headers_mut();
         headers.set("Access-Control-Allow-Origin", origin)?;
         headers.set(
             "Access-Control-Expose-Headers",
