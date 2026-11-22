@@ -15,3 +15,8 @@ routes = [
   { pattern = "example.com/api/comments*", zone_name = "example.com" },
   { pattern = "mirror.example.org/api/comments*", zone_name = "mirror.example.org" }
 ]
+
+[vars]
+EXPORT_DEFAULT_LIMIT = "20"
+EXPORT_MAX_LIMIT = "100"
+EXPORT_MAX_BYTES = "32768"

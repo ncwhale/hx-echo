@@ -66,9 +66,18 @@ npx wrangler deploy
 
 | Method | Path | Params | Response |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/comments/export` | `?slug=/posts/xxx/` | `200 OK` JSON `{ "lastCursor": <id>, "html": "..." }` |
-| `GET` | `/api/comments` | `?slug=/posts/xxx/&after=<id>` | `204 No Content` if idle, or `200 OK` `text/html` fragments |
-| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `website` | `200 OK` `text/html` `<li>` (sets `HX-Retarget` / `HX-Reswap` for replies) |
+| `GET` | `/api/comments/export` | `?slug=/posts/xxx/&limit=20&max_bytes=32768` | `200 OK` JSON `{ "lastCursor": <id>, "firstCursor": <id>, "hasMore": bool, "exportedCount": n, "htmlBytes": n, "html": "..." }` |
+| `GET` | `/api/comments` | `?slug=...&after=<id>` (delta) / `&before=<id>&limit=20` (older roots) / `&parent_id=<id>&before\|after=<id>` (thread replies) | `204 No Content` (idle delta) or `200 OK` `text/html` fragments |
+| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `website` | `200 OK` `text/html` `<li>` (sets `HX-Retarget` / `HX-Reswap` and OOB reply count for replies) |
+
+### Export Limits & Byte Circuit Breaker
+
+In `wrangler.toml` (`[vars]`), administrators can configure:
+- `EXPORT_DEFAULT_LIMIT` (default `"20"`): default max comment items exported per page build.
+- `EXPORT_MAX_LIMIT` (default `"100"`): upper bound for `?limit=`.
+- `EXPORT_MAX_BYTES` (default `"32768"`, i.e. 32 KiB): default and forced maximum UTF-8 byte size of exported `html` (callers can request a smaller `?max_bytes=` / `?maxBytes=`, never larger).
+
+When exported history or thread replies are truncated, `hx-echo` emits user-triggered HTMX buttons (`#load-older-comments`, `#load-older-replies-<id>`, `#load-newer-replies-<id>`) so visitors can load older comments and older/newer replies on demand.
 
 ## Frontend Integration (Hugo + HTMX)
 
