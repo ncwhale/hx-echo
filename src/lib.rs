@@ -587,7 +587,7 @@ fn handle_preflight(
         headers.set("Access-Control-Allow-Headers", allow_headers)?;
         headers.set(
             "Access-Control-Expose-Headers",
-            "HX-Retarget, HX-Reswap, HX-Trigger, HX-Refresh, HX-Redirect",
+            "HX-Retarget, HX-Reswap, HX-Reselect, HX-Trigger, HX-Trigger-After-Swap, HX-Trigger-After-Settle, HX-Refresh, HX-Redirect, HX-Location, HX-Push, HX-Push-Url, HX-Replace-Url",
         )?;
         headers.set("Access-Control-Max-Age", "86400")?;
         headers.set("Vary", "Origin")?;
@@ -602,7 +602,7 @@ fn with_cors_headers(mut resp: Response, allowed_origin: Option<&str>) -> Result
         headers.set("Access-Control-Allow-Origin", origin)?;
         headers.set(
             "Access-Control-Expose-Headers",
-            "HX-Retarget, HX-Reswap, HX-Trigger, HX-Refresh, HX-Redirect",
+            "HX-Retarget, HX-Reswap, HX-Reselect, HX-Trigger, HX-Trigger-After-Swap, HX-Trigger-After-Settle, HX-Refresh, HX-Redirect, HX-Location, HX-Push, HX-Push-Url, HX-Replace-Url",
         )?;
         headers.set("Vary", "Origin")?;
     }
