@@ -1,17 +1,19 @@
 # hx-echo
 
+[English](./README.md) | [简体中文](./README.zh_CN.md)
+
 A lightweight, HTMX-driven comment system built in **Rust (WebAssembly)** for static sites on **Cloudflare Workers & D1**.
 
 ## How It Works (Base + Delta)
 
 `hx-echo` splits comments into a **static baseline** and an **incremental runtime delta**:
 
-1. **Build-Time Baseline**: During static site generation (e.g., Hugo `resources.GetRemote`), your SSG fetches `GET /api/comments/export?slug=/posts/hello-world/` and bakes existing comments directly into the HTML along with `lastCursor`.
-2. **Runtime Delta (HTMX)**: On page load (`hx-trigger="load"`), HTMX requests `GET /api/comments?slug=/posts/hello-world/&after=<lastCursor>`.
-   - If no new comments exist, the Worker returns `204 No Content` (zero DOM changes).
-   - New top-level comments are appended to `#comment-list`; replies to already-rendered static comments use `hx-swap-oob="beforeend:#replies-for-<parent_id>"`.
-3. **Comment Submission**: Submitting the form via `hx-post="/api/comments"` renders Markdown (`pulldown-cmark`), sanitizes HTML (`ammonia`), checks the hidden `website` honeypot field, saves to D1, and returns the rendered `<li>` (using `HX-Retarget` / `HX-Reswap` headers for replies).
-4. **Same-Origin Multi-Domain Support**: Mount the Worker under `*<domain>/api/comments*` across mirror domains to avoid CORS preflights. Slugs are normalized to pathname-only (`RelPermalink`).
+1. **Build-Time Baseline**: During static site generation (e.g., Hugo `resources.GetRemote`), your SSG fetches `GET /api/comments/export?slug=/posts/hello-world/&lang=en` and bakes existing comments directly into the HTML along with `lastCursor`.
+2. **Runtime Delta (HTMX)**: When the comment list enters the viewport (`hx-trigger="intersect once"`) or loads, HTMX requests `GET /api/comments?slug=/posts/hello-world/&after=<lastCursor>`.
+   - If no new comments exist, the Worker returns `204 No Content` with `Cache-Control: no-store` (zero DOM changes).
+   - New top-level comments are appended to `#comment-list`; replies to already-rendered static comments use `hx-swap-oob="beforeend:#replies-for-<parent_id>"` along with OOB `#reply-count-<parent_id>` updates.
+3. **Comment Submission**: Submitting the form via `hx-post="/api/comments"` renders Markdown (`pulldown-cmark`), sanitizes HTML (`ammonia`), checks the hidden `website` honeypot field, saves to D1, and returns the rendered `<li>` (using `HX-Retarget` / `HX-Reswap` headers and OOB reply count for replies).
+4. **Same-Origin Multi-Domain & Local Dev Support**: Mount the Worker under `<domain>/api/comments*` across mirror domains (`koa.im`, `www.koa.im`, etc.) to avoid CORS preflights. Loopback dev origins (`http://localhost:*`, `http://127.0.0.1:*`) and `CORS_ALLOW_ORIGINS` are supported automatically with full `HX-*` header exposure. Slugs are normalized to pathname-only (`RelPermalink`).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full specification and Hugo partial reference.
 
@@ -66,9 +68,9 @@ npx wrangler deploy
 
 | Method | Path | Params | Response |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/comments/export` | `?slug=/posts/xxx/&limit=20&max_bytes=32768` | `200 OK` JSON `{ "lastCursor": <id>, "firstCursor": <id>, "hasMore": bool, "exportedCount": n, "htmlBytes": n, "html": "..." }` |
-| `GET` | `/api/comments` | `?slug=...&after=<id>` (delta) / `&before=<id>&limit=20` (older roots) / `&parent_id=<id>&before\|after=<id>` (thread replies) | `204 No Content` (idle delta) or `200 OK` `text/html` fragments |
-| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `website` | `200 OK` `text/html` `<li>` (sets `HX-Retarget` / `HX-Reswap` and OOB reply count for replies) |
+| `GET` | `/api/comments/export` | `?slug=/posts/xxx/&limit=20&max_bytes=32768&lang=en` | `200 OK` JSON `{ "lastCursor": <id>, "firstCursor": <id>, "hasMore": bool, "exportedCount": n, "htmlBytes": n, "html": "..." }` |
+| `GET` | `/api/comments` | `?slug=...&after=<id>` (delta) / `&before=<id>&limit=20` (older roots) / `&parent_id=<id>&before\|after=<id>` (thread replies), optional `&lang=` | `204 No Content` (idle delta) or `200 OK` `text/html` fragments (`Cache-Control: no-store`) |
+| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `lang?`, `website` | `200 OK` `text/html` `<li>` (sets `HX-Retarget` / `HX-Reswap` and OOB reply count for replies) |
 
 ### Export Limits & Byte Circuit Breaker
 
