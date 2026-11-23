@@ -73,11 +73,18 @@ npx wrangler deploy
 ### Export Limits & Byte Circuit Breaker
 
 In `wrangler.toml` (`[vars]`), administrators can configure:
+- `DEFAULT_LANG` (default `"en"`): fallback UI language (`en`, `zh-cn`, `zh-tw`, `ja`) when `?lang=`, `HX-Lang`, or `Accept-Language` is not specified.
 - `EXPORT_DEFAULT_LIMIT` (default `"20"`): default max comment items exported per page build.
 - `EXPORT_MAX_LIMIT` (default `"100"`): upper bound for `?limit=`.
 - `EXPORT_MAX_BYTES` (default `"32768"`, i.e. 32 KiB): default and forced maximum UTF-8 byte size of exported `html` (callers can request a smaller `?max_bytes=` / `?maxBytes=`, never larger).
 
 When exported history or thread replies are truncated, `hx-echo` emits user-triggered HTMX buttons (`#load-older-comments`, `#load-older-replies-<id>`, `#load-newer-replies-<id>`) so visitors can load older comments and older/newer replies on demand.
+
+### Internationalization (i18n)
+
+`hx-echo` supports both **server-rendered localization** and **client-side custom overrides**:
+- **Server-side locales**: Built-in translations for `en` (default), `zh-cn`, `zh-tw`, and `ja`, resolved in priority order: `lang` (form/query) > `HX-Lang` header > `Accept-Language` header > `DEFAULT_LANG` env var > `en`. Explicit `?lang=` is preserved in pagination button URLs.
+- **Client-side overrides**: Rendered elements carry semantic attributes (`data-i18n="reply"`, `data-i18n="reply-count"` with `data-count`, `data-i18n="load-older-comments"`, `data-i18n="load-older-replies-remaining"` with `data-remaining`, `data-i18n="load-replies-total"` with `data-total`, `data-i18n="load-older-replies"`, `data-i18n="load-newer-replies"`) so static site templates can localize or customize labels to any language on `htmx:afterSettle`.
 
 ## Frontend Integration (Hugo + HTMX)
 

@@ -17,6 +17,7 @@ routes = [
 ]
 
 [vars]
+DEFAULT_LANG = "en"
 EXPORT_DEFAULT_LIMIT = "20"
 EXPORT_MAX_LIMIT = "100"
 EXPORT_MAX_BYTES = "32768"

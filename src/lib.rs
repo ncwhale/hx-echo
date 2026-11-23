@@ -103,6 +103,13 @@ async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     };
 
     let db = ctx.env.d1("DB")?;
+    let (locale, query_lang) = resolve_request_locale(&req, &url, None, &ctx.env);
+    let render_ctx = RenderCtx {
+        slug: &slug,
+        locale,
+        query_lang,
+    };
+
     let roots_desc = fetch_roots_desc(&db, &slug, None, limit + 1).await?;
 
     let mut replies_desc_by_root: BTreeMap<i64, Vec<CommentRow>> = BTreeMap::new();
@@ -117,7 +124,13 @@ async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         }
     }
 
-    let export = build_export_package(&slug, &roots_desc, &replies_desc_by_root, limit, max_bytes);
+    let export = build_export_package(
+        &render_ctx,
+        &roots_desc,
+        &replies_desc_by_root,
+        limit,
+        max_bytes,
+    );
     Response::from_json(&export)
 }
 
@@ -160,6 +173,12 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         .get("HX-Request")?
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let (locale, query_lang) = resolve_request_locale(&req, &url, None, &ctx.env);
+    let render_ctx = RenderCtx {
+        slug: &slug,
+        locale,
+        query_lang,
+    };
 
     let db = ctx.env.d1("DB")?;
 
@@ -186,7 +205,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
             let has_more_older = rows_desc.len() > limit;
             rows_desc.truncate(limit);
             rows_desc.reverse();
-            build_thread_replies_html(&slug, pid, &rows_desc, has_more_older, false)
+            build_thread_replies_html(&render_ctx, pid, &rows_desc, has_more_older, false)
         } else if let Some(after_id) = after {
             let mut rows_asc = db
                 .prepare(
@@ -207,7 +226,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
 
             let has_more_newer = rows_asc.len() > limit;
             rows_asc.truncate(limit);
-            build_thread_replies_html(&slug, pid, &rows_asc, false, has_more_newer)
+            build_thread_replies_html(&render_ctx, pid, &rows_asc, false, has_more_newer)
         } else {
             let mut rows_asc = db
                 .prepare(
@@ -227,7 +246,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
 
             let has_more_newer = rows_asc.len() > limit;
             rows_asc.truncate(limit);
-            build_thread_replies_html(&slug, pid, &rows_asc, false, has_more_newer)
+            build_thread_replies_html(&render_ctx, pid, &rows_asc, false, has_more_newer)
         };
 
         // Return 200 empty HTML so hx-swap="outerHTML" cleanly removes the trigger item.
@@ -256,7 +275,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         }
 
         roots_desc.reverse();
-        let html = build_older_roots_html(&slug, &roots_desc, &replies_by_root, has_more_older);
+        let html = build_older_roots_html(&render_ctx, &roots_desc, &replies_by_root, has_more_older);
         return Response::from_html(html);
     }
 
@@ -281,7 +300,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         return empty_no_content();
     }
 
-    let mut html = build_delta_html(&slug, &rows);
+    let mut html = build_delta_html(&render_ctx, &rows);
     if html.is_empty() {
         return empty_no_content();
     }
@@ -303,7 +322,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         }
         for root_id in oob_root_ids {
             let cnt = fetch_reply_count(&db, root_id).await?;
-            html.push_str(&render_reply_count_oob(root_id, cnt));
+            html.push_str(&render_reply_count_oob(root_id, cnt, locale));
         }
     }
 
@@ -423,17 +442,26 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         .first(None)
         .await?;
 
+    let url = req.url()?;
+    let form_lang = form_field(&form, "lang");
+    let (locale, query_lang) = resolve_request_locale(&req, &url, form_lang.as_deref(), &ctx.env);
+    let render_ctx = RenderCtx {
+        slug: &slug,
+        locale,
+        query_lang,
+    };
+
     let comment = inserted.ok_or_else(|| Error::RustError("Failed to insert comment".into()))?;
 
     let mut html = match comment.parent_id {
-        Some(root_id) => render_reply_item(&comment, root_id, false),
-        None => render_comment_node(&slug, &comment, &[], 0, 0),
+        Some(root_id) => render_reply_item(&comment, root_id, false, locale),
+        None => render_comment_node(&render_ctx, &comment, &[], 0, 0),
     };
 
     if is_htmx {
         if let Some(root_id) = comment.parent_id {
             let count = fetch_reply_count(&db, root_id).await?;
-            html.push_str(&render_reply_count_oob(root_id, count));
+            html.push_str(&render_reply_count_oob(root_id, count, locale));
         }
     }
 
@@ -776,10 +804,189 @@ struct ExportEntry<'a> {
     replies_desc: Vec<&'a CommentRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Locale {
+    En,
+    ZhCn,
+    ZhTw,
+    Ja,
+}
+
+struct RenderCtx<'a> {
+    slug: &'a str,
+    locale: Locale,
+    query_lang: Option<Locale>,
+}
+
+impl Locale {
+    fn code(self) -> &'static str {
+        match self {
+            Locale::En => "en",
+            Locale::ZhCn => "zh-cn",
+            Locale::ZhTw => "zh-tw",
+            Locale::Ja => "ja",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        let norm = raw.trim().to_ascii_lowercase().replace('_', "-");
+        if norm.is_empty() {
+            return None;
+        }
+        if norm == "en" || norm.starts_with("en-") {
+            return Some(Locale::En);
+        }
+        if norm == "ja" || norm.starts_with("ja-") {
+            return Some(Locale::Ja);
+        }
+        if matches!(norm.as_str(), "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant")
+            || norm.starts_with("zh-hant-")
+        {
+            return Some(Locale::ZhTw);
+        }
+        if norm == "zh" || norm == "zh-cn" || norm == "zh-sg" || norm.starts_with("zh-hans") || norm.starts_with("zh-cn-") {
+            return Some(Locale::ZhCn);
+        }
+        None
+    }
+
+    fn from_accept_language(header: &str) -> Option<Self> {
+        let mut best: Option<(f32, usize, Locale)> = None;
+        for (idx, part) in header.split(',').enumerate() {
+            let mut segments = part.split(';');
+            let tag = segments.next().unwrap_or("").trim();
+            if tag.is_empty() || tag == "*" {
+                continue;
+            }
+            let mut q = 1.0_f32;
+            for param in segments {
+                let p = param.trim();
+                if let Some(val) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                    if let Ok(parsed) = val.trim().parse::<f32>() {
+                        q = parsed;
+                    }
+                }
+            }
+            if q <= 0.0 {
+                continue;
+            }
+            if let Some(loc) = Locale::parse(tag) {
+                match best {
+                    None => best = Some((q, idx, loc)),
+                    Some((best_q, best_idx, _)) if q > best_q || (q == best_q && idx < best_idx) => {
+                        best = Some((q, idx, loc));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(_, _, loc)| loc)
+    }
+
+    fn reply_label(self) -> &'static str {
+        match self {
+            Locale::En => "Reply",
+            Locale::ZhCn => "回复",
+            Locale::ZhTw => "回覆",
+            Locale::Ja => "返信",
+        }
+    }
+
+    fn format_reply_count(self, count: i64) -> String {
+        match self {
+            Locale::En => {
+                if count == 1 {
+                    "1 reply".to_string()
+                } else {
+                    format!("{count} replies")
+                }
+            }
+            Locale::ZhCn => format!("{count} 条回复"),
+            Locale::ZhTw => format!("{count} 則回覆"),
+            Locale::Ja => format!("{count} 件の返信"),
+        }
+    }
+
+    fn load_older_comments_label(self) -> &'static str {
+        match self {
+            Locale::En => "Load older comments",
+            Locale::ZhCn => "加载更早评论",
+            Locale::ZhTw => "載入較早評論",
+            Locale::Ja => "以前のコメントを読み込む",
+        }
+    }
+
+    fn load_older_replies_remaining_label(self, remaining: usize) -> String {
+        match self {
+            Locale::En => format!("Load older replies ({remaining} more)"),
+            Locale::ZhCn => format!("加载更早回复 (还有 {remaining} 条)"),
+            Locale::ZhTw => format!("載入較早回覆 (還有 {remaining} 則)"),
+            Locale::Ja => format!("以前の返信を読み込む (残り {remaining} 件)"),
+        }
+    }
+
+    fn load_replies_total_label(self, total: usize) -> String {
+        match self {
+            Locale::En => format!("Load replies ({total} total)"),
+            Locale::ZhCn => format!("加载回复 (共 {total} 条)"),
+            Locale::ZhTw => format!("載入回覆 (共 {total} 則)"),
+            Locale::Ja => format!("返信を読み込む (全 {total} 件)"),
+        }
+    }
+
+    fn load_older_replies_label(self) -> &'static str {
+        match self {
+            Locale::En => "Load older replies",
+            Locale::ZhCn => "加载更早回复",
+            Locale::ZhTw => "載入較早回覆",
+            Locale::Ja => "以前の返信を読み込む",
+        }
+    }
+
+    fn load_newer_replies_label(self) -> &'static str {
+        match self {
+            Locale::En => "Load more replies",
+            Locale::ZhCn => "加载更多回复",
+            Locale::ZhTw => "載入更多回覆",
+            Locale::Ja => "さらに返信を読み込む",
+        }
+    }
+}
+
+fn resolve_request_locale(
+    req: &Request,
+    url: &Url,
+    form_lang: Option<&str>,
+    env: &Env,
+) -> (Locale, Option<Locale>) {
+    if let Some(loc) = form_lang.and_then(Locale::parse) {
+        return (loc, Some(loc));
+    }
+    if let Some(loc) = query_param(url, "lang").and_then(|s| Locale::parse(&s)) {
+        return (loc, Some(loc));
+    }
+    if let Ok(Some(hx_lang)) = req.headers().get("HX-Lang") {
+        if let Some(loc) = Locale::parse(&hx_lang) {
+            return (loc, None);
+        }
+    }
+    if let Ok(Some(accept)) = req.headers().get("Accept-Language") {
+        if let Some(loc) = Locale::from_accept_language(&accept) {
+            return (loc, None);
+        }
+    }
+    if let Ok(var) = env.var("DEFAULT_LANG") {
+        if let Some(loc) = Locale::parse(&var.to_string()) {
+            return (loc, None);
+        }
+    }
+    (Locale::En, None)
+}
+
 /// Packs the newest comments within `limit` items and `max_bytes` UTF-8 bytes,
 /// emitting HTMX pagination triggers where history or replies are truncated.
 fn build_export_package(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     roots_desc: &[CommentRow],
     replies_desc_by_root: &BTreeMap<i64, Vec<CommentRow>>,
     limit: usize,
@@ -813,7 +1020,7 @@ fn build_export_package(
             replies_desc: Vec::new(),
         });
 
-        let candidate_html = render_export_entries(slug, &accepted, remaining_roots_exist);
+        let candidate_html = render_export_entries(ctx, &accepted, remaining_roots_exist);
         if candidate_html.len() > max_bytes {
             accepted.pop();
             break;
@@ -826,7 +1033,7 @@ fn build_export_package(
                     break;
                 }
                 accepted.last_mut().unwrap().replies_desc.push(reply);
-                let candidate_html = render_export_entries(slug, &accepted, remaining_roots_exist);
+                let candidate_html = render_export_entries(ctx, &accepted, remaining_roots_exist);
                 if candidate_html.len() > max_bytes {
                     accepted.last_mut().unwrap().replies_desc.pop();
                     break;
@@ -851,7 +1058,7 @@ fn build_export_package(
                     break;
                 }
                 accepted[idx].replies_desc.push(reply);
-                let candidate_html = render_export_entries(slug, &accepted, has_more_roots);
+                let candidate_html = render_export_entries(ctx, &accepted, has_more_roots);
                 if candidate_html.len() > max_bytes {
                     accepted[idx].replies_desc.pop();
                     break;
@@ -861,7 +1068,7 @@ fn build_export_package(
         }
     }
 
-    let html = render_export_entries(slug, &accepted, has_more_roots);
+    let html = render_export_entries(ctx, &accepted, has_more_roots);
     let html_bytes = html.len();
     let first_cursor = accepted.last().map(|e| e.root.id).unwrap_or(0);
 
@@ -890,7 +1097,7 @@ fn build_export_package(
 }
 
 fn render_export_entries(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     entries_desc: &[ExportEntry<'_>],
     has_more_roots: bool,
 ) -> String {
@@ -901,7 +1108,7 @@ fn render_export_entries(
     let mut html = String::new();
     if has_more_roots {
         let oldest_root_id = entries_desc.last().unwrap().root.id;
-        html.push_str(&render_load_older_comments_item(slug, oldest_root_id));
+        html.push_str(&render_load_older_comments_item(ctx, oldest_root_id));
     }
 
     for entry in entries_desc.iter().rev() {
@@ -910,7 +1117,7 @@ fn render_export_entries(
         let total_replies = effective_reply_count(entry.root, children_asc.len());
         let hidden_older = (total_replies as usize).saturating_sub(children_asc.len());
         html.push_str(&render_comment_node(
-            slug,
+            ctx,
             entry.root,
             &children_asc,
             total_replies,
@@ -922,7 +1129,7 @@ fn render_export_entries(
 }
 
 fn build_older_roots_html(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     roots_asc: &[CommentRow],
     replies_desc_by_root: &BTreeMap<i64, Vec<CommentRow>>,
     has_more_older: bool,
@@ -933,7 +1140,7 @@ fn build_older_roots_html(
 
     let mut html = String::new();
     if has_more_older {
-        html.push_str(&render_load_older_comments_item(slug, roots_asc[0].id));
+        html.push_str(&render_load_older_comments_item(ctx, roots_asc[0].id));
     }
 
     for root in roots_asc {
@@ -945,7 +1152,7 @@ fn build_older_roots_html(
         let total_replies = effective_reply_count(root, children_asc.len());
         let hidden_older = (total_replies as usize).saturating_sub(children_asc.len());
         html.push_str(&render_comment_node(
-            slug,
+            ctx,
             root,
             &children_asc,
             total_replies,
@@ -957,7 +1164,7 @@ fn build_older_roots_html(
 }
 
 fn build_thread_replies_html(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     root_id: i64,
     replies_asc: &[CommentRow],
     has_more_older: bool,
@@ -970,18 +1177,18 @@ fn build_thread_replies_html(
     let mut html = String::new();
     if has_more_older {
         html.push_str(&render_load_older_replies_item(
-            slug,
+            ctx,
             root_id,
             Some(replies_asc[0].id),
             None,
         ));
     }
     for reply in replies_asc {
-        html.push_str(&render_reply_item(reply, root_id, false));
+        html.push_str(&render_reply_item(reply, root_id, false, ctx.locale));
     }
     if has_more_newer {
         let last_id = replies_asc.last().unwrap().id;
-        html.push_str(&render_load_newer_replies_item(slug, root_id, last_id));
+        html.push_str(&render_load_newer_replies_item(ctx, root_id, last_id));
     }
     html
 }
@@ -989,7 +1196,7 @@ fn build_thread_replies_html(
 /// Builds incremental HTMX fragments for comments newer than `after`.
 /// Replies to new top-level comments in the same batch are nested directly;
 /// replies to existing static comments carry `hx-swap-oob="beforeend:#replies-for-{parent_id}"`.
-fn build_delta_html(slug: &str, rows: &[CommentRow]) -> String {
+fn build_delta_html(ctx: &RenderCtx<'_>, rows: &[CommentRow]) -> String {
     let new_root_ids: HashSet<i64> = rows
         .iter()
         .filter(|r| r.parent_id.is_none())
@@ -1019,7 +1226,7 @@ fn build_delta_html(slug: &str, rows: &[CommentRow]) -> String {
         let total_replies = effective_reply_count(root, children.len());
         let hidden_older = (total_replies as usize).saturating_sub(children.len());
         html.push_str(&render_comment_node(
-            slug,
+            ctx,
             root,
             children,
             total_replies,
@@ -1028,7 +1235,7 @@ fn build_delta_html(slug: &str, rows: &[CommentRow]) -> String {
     }
     for reply in oob_replies {
         if let Some(root_id) = reply.parent_id {
-            html.push_str(&render_reply_item(reply, root_id, true));
+            html.push_str(&render_reply_item(reply, root_id, true, ctx.locale));
         }
     }
 
@@ -1040,7 +1247,7 @@ fn effective_reply_count(root: &CommentRow, rendered_children_len: usize) -> i64
 }
 
 fn render_comment_node(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     comment: &CommentRow,
     children: &[&CommentRow],
     reply_count: i64,
@@ -1048,25 +1255,27 @@ fn render_comment_node(
 ) -> String {
     let author_html = escape_html(&comment.author);
     let author_js = escape_js_single_quoted(&comment.author);
-    let reply_count_badge = render_reply_count_span(comment.id, reply_count, false);
+    let reply_count_badge = render_reply_count_span(comment.id, reply_count, false, ctx.locale);
+    let reply_label = ctx.locale.reply_label();
 
     let mut out = String::new();
     let _ = write!(
         out,
-        r#"<li id="comment-{id}" class="comment-item" data-reply-count="{reply_count}"><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time>{reply_count_badge}<button type="button" class="reply-btn" onclick="setReplyTarget({id}, '{author_js}')">回复</button></div><div class="comment-body">{body}</div><ul id="replies-for-{id}" class="comment-replies">"#,
+        r#"<li id="comment-{id}" class="comment-item" data-reply-count="{reply_count}"><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time>{reply_count_badge}<button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{body}</div><ul id="replies-for-{id}" class="comment-replies">"#,
         id = comment.id,
         reply_count = reply_count,
         author = author_html,
         ts = comment.created_at,
         reply_count_badge = reply_count_badge,
         author_js = author_js,
+        reply_label = reply_label,
         body = comment.content_html,
     );
 
     if hidden_older_replies > 0 {
         let before_id = children.first().map(|c| c.id);
         out.push_str(&render_load_older_replies_item(
-            slug,
+            ctx,
             comment.id,
             before_id,
             Some(hidden_older_replies),
@@ -1074,72 +1283,95 @@ fn render_comment_node(
     }
 
     for child in children {
-        out.push_str(&render_reply_item(child, comment.id, false));
+        out.push_str(&render_reply_item(child, comment.id, false, ctx.locale));
     }
 
     out.push_str("</ul></li>");
     out
 }
 
-fn render_reply_count_span(root_id: i64, count: i64, oob: bool) -> String {
+fn render_reply_count_span(root_id: i64, count: i64, oob: bool, locale: Locale) -> String {
     let oob_attr = if oob {
         r#" hx-swap-oob="outerHTML""#
     } else {
         ""
     };
     if count > 0 {
+        let text = locale.format_reply_count(count);
         format!(
-            r#"<span id="reply-count-{root_id}" class="reply-count" data-count="{count}"{oob_attr}>{count} 条回复</span>"#,
+            r#"<span id="reply-count-{root_id}" class="reply-count" data-count="{count}" data-i18n="reply-count"{oob_attr}>{text}</span>"#,
         )
     } else {
         format!(
-            r#"<span id="reply-count-{root_id}" class="reply-count" data-count="0"{oob_attr}></span>"#,
+            r#"<span id="reply-count-{root_id}" class="reply-count" data-count="0" data-i18n="reply-count"{oob_attr}></span>"#,
         )
     }
 }
 
-fn render_reply_count_oob(root_id: i64, count: i64) -> String {
-    render_reply_count_span(root_id, count, true)
+fn render_reply_count_oob(root_id: i64, count: i64, locale: Locale) -> String {
+    render_reply_count_span(root_id, count, true, locale)
 }
 
-fn render_load_older_comments_item(slug: &str, before_id: i64) -> String {
-    let encoded_slug = encode_uri_component(slug);
+fn lang_query_suffix(query_lang: Option<Locale>) -> String {
+    match query_lang {
+        Some(loc) => format!("&amp;lang={}", loc.code()),
+        None => String::new(),
+    }
+}
+
+fn render_load_older_comments_item(ctx: &RenderCtx<'_>, before_id: i64) -> String {
+    let encoded_slug = encode_uri_component(ctx.slug);
+    let lang_suffix = lang_query_suffix(ctx.query_lang);
+    let label = ctx.locale.load_older_comments_label();
     format!(
-        r##"<li id="load-older-comments" class="load-older-item"><button type="button" class="load-older-btn" hx-get="/api/comments?slug={encoded_slug}&amp;before={before_id}" hx-target="#load-older-comments" hx-swap="outerHTML">加载更早评论</button></li>"##,
+        r##"<li id="load-older-comments" class="load-older-item"><button type="button" class="load-older-btn" data-i18n="load-older-comments" hx-get="/api/comments?slug={encoded_slug}&amp;before={before_id}{lang_suffix}" hx-target="#load-older-comments" hx-swap="outerHTML">{label}</button></li>"##,
     )
 }
 
 fn render_load_older_replies_item(
-    slug: &str,
+    ctx: &RenderCtx<'_>,
     root_id: i64,
     before_id: Option<i64>,
     remaining_hint: Option<usize>,
 ) -> String {
-    let encoded_slug = encode_uri_component(slug);
+    let encoded_slug = encode_uri_component(ctx.slug);
+    let lang_suffix = lang_query_suffix(ctx.query_lang);
     let cursor_param = match before_id {
         Some(bid) => format!("&amp;before={}", bid),
         None => String::new(),
     };
-    let label = match (before_id, remaining_hint) {
-        (Some(_), Some(n)) => format!("加载更早回复 (还有 {} 条)", n),
-        (None, Some(n)) => format!("加载回复 (共 {} 条)", n),
-        _ => "加载更早回复".to_string(),
+    let (i18n_attrs, label) = match (before_id, remaining_hint) {
+        (Some(_), Some(n)) => (
+            format!(r#"data-i18n="load-older-replies-remaining" data-remaining="{n}""#),
+            ctx.locale.load_older_replies_remaining_label(n),
+        ),
+        (None, Some(n)) => (
+            format!(r#"data-i18n="load-replies-total" data-total="{n}""#),
+            ctx.locale.load_replies_total_label(n),
+        ),
+        _ => (
+            r#"data-i18n="load-older-replies""#.to_string(),
+            ctx.locale.load_older_replies_label().to_string(),
+        ),
     };
     format!(
-        r##"<li id="load-older-replies-{root_id}" class="load-more-replies"><button type="button" class="load-replies-btn" hx-get="/api/comments?slug={encoded_slug}&amp;parent_id={root_id}{cursor_param}" hx-target="#load-older-replies-{root_id}" hx-swap="outerHTML">{label}</button></li>"##,
+        r##"<li id="load-older-replies-{root_id}" class="load-more-replies"><button type="button" class="load-replies-btn" {i18n_attrs} hx-get="/api/comments?slug={encoded_slug}&amp;parent_id={root_id}{cursor_param}{lang_suffix}" hx-target="#load-older-replies-{root_id}" hx-swap="outerHTML">{label}</button></li>"##,
     )
 }
 
-fn render_load_newer_replies_item(slug: &str, root_id: i64, after_id: i64) -> String {
-    let encoded_slug = encode_uri_component(slug);
+fn render_load_newer_replies_item(ctx: &RenderCtx<'_>, root_id: i64, after_id: i64) -> String {
+    let encoded_slug = encode_uri_component(ctx.slug);
+    let lang_suffix = lang_query_suffix(ctx.query_lang);
+    let label = ctx.locale.load_newer_replies_label();
     format!(
-        r##"<li id="load-newer-replies-{root_id}" class="load-more-replies"><button type="button" class="load-replies-btn" hx-get="/api/comments?slug={encoded_slug}&amp;parent_id={root_id}&amp;after={after_id}" hx-target="#load-newer-replies-{root_id}" hx-swap="outerHTML">加载更多回复</button></li>"##,
+        r##"<li id="load-newer-replies-{root_id}" class="load-more-replies"><button type="button" class="load-replies-btn" data-i18n="load-newer-replies" hx-get="/api/comments?slug={encoded_slug}&amp;parent_id={root_id}&amp;after={after_id}{lang_suffix}" hx-target="#load-newer-replies-{root_id}" hx-swap="outerHTML">{label}</button></li>"##,
     )
 }
 
-fn render_reply_item(reply: &CommentRow, root_id: i64, oob: bool) -> String {
+fn render_reply_item(reply: &CommentRow, root_id: i64, oob: bool, locale: Locale) -> String {
     let author_html = escape_html(&reply.author);
     let author_js = escape_js_single_quoted(&reply.author);
+    let reply_label = locale.reply_label();
 
     let oob_attr = if oob {
         format!(r#" hx-swap-oob="beforeend:#replies-for-{}""#, root_id)
@@ -1155,13 +1387,14 @@ fn render_reply_item(reply: &CommentRow, root_id: i64, oob: bool) -> String {
     };
 
     format!(
-        r#"<li id="comment-{id}" class="comment-reply-item"{oob}><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time><button type="button" class="reply-btn" onclick="setReplyTarget({root_id}, '{author_js}')">回复</button></div><div class="comment-body">{prefix}{body}</div></li>"#,
+        r#"<li id="comment-{id}" class="comment-reply-item"{oob}><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time><button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({root_id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{prefix}{body}</div></li>"#,
         id = reply.id,
         oob = oob_attr,
         author = author_html,
         ts = reply.created_at,
         root_id = root_id,
         author_js = author_js,
+        reply_label = reply_label,
         prefix = reply_to_prefix,
         body = reply.content_html,
     )
@@ -1242,9 +1475,15 @@ mod tests {
         replies_desc_by_root.insert(101, vec![c1]);
         replies_desc_by_root.insert(103, vec![c3, c2]);
 
+        let ctx = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::ZhCn,
+            query_lang: Some(Locale::ZhCn),
+        };
+
         // Limit = 3 items -> accepts r2 + c3 + c2 (3 items), truncates r1.
         let pkg = build_export_package(
-            "/posts/hello-world/",
+            &ctx,
             &roots_desc,
             &replies_desc_by_root,
             3,
@@ -1255,7 +1494,8 @@ mod tests {
         assert_eq!(pkg.last_cursor, 105);
         assert!(pkg.has_more);
         assert!(pkg.html.contains(r#"id="load-older-comments""#));
-        assert!(pkg.html.contains("before=103"));
+        assert!(pkg.html.contains("before=103&amp;lang=zh-cn"));
+        assert!(pkg.html.contains(r#"data-i18n="load-older-comments""#));
         assert!(pkg.html.contains(r#"data-reply-count="2""#));
         assert!(pkg.html.contains(">2 条回复</span>"));
         assert!(!pkg.html.contains(r#"id="comment-101""#));
@@ -1269,10 +1509,15 @@ mod tests {
 
         let roots_desc = vec![r3, r2, r1];
         let replies_desc_by_root = BTreeMap::new();
+        let ctx = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::En,
+            query_lang: None,
+        };
 
-        // Budget of 1400 bytes fits 1 root (~900 bytes + load-older button ~230 bytes) but not 2 roots.
+        // Budget of 1400 bytes fits 1 root (~900 bytes + load-older button ~260 bytes) but not 2 roots.
         let pkg = build_export_package(
-            "/posts/hello-world/",
+            &ctx,
             &roots_desc,
             &replies_desc_by_root,
             20,
@@ -1285,10 +1530,11 @@ mod tests {
         assert!(pkg.html.contains(r#"id="comment-103""#));
         assert!(!pkg.html.contains(r#"id="comment-102""#));
         assert!(pkg.html.contains("before=103"));
+        assert!(pkg.html.contains(">Load older comments</button>"));
 
         // Budget smaller than a single comment strictly yields 0 bytes.
         let tiny = build_export_package(
-            "/posts/hello-world/",
+            &ctx,
             &roots_desc,
             &replies_desc_by_root,
             20,
@@ -1312,10 +1558,15 @@ mod tests {
         let roots_desc = vec![r1];
         let mut replies_desc_by_root = BTreeMap::new();
         replies_desc_by_root.insert(101, vec![c4, c3, c2, c1]);
+        let ctx = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::ZhCn,
+            query_lang: None,
+        };
 
         // Limit = 3 -> 1 root + 2 newest replies (104, 105), 2 older replies truncated.
         let pkg = build_export_package(
-            "/posts/hello-world/",
+            &ctx,
             &roots_desc,
             &replies_desc_by_root,
             3,
@@ -1326,6 +1577,7 @@ mod tests {
         assert!(pkg.has_more);
         assert!(pkg.html.contains(r#"id="load-older-replies-101""#));
         assert!(pkg.html.contains("parent_id=101&amp;before=104"));
+        assert!(pkg.html.contains(r#"data-i18n="load-older-replies-remaining" data-remaining="2""#));
         assert!(pkg.html.contains("还有 2 条"));
         assert!(!pkg.html.contains(r#"id="comment-102""#));
     }
@@ -1351,13 +1603,19 @@ mod tests {
                 1732123800,
             ),
         ];
+        let ctx = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::En,
+            query_lang: None,
+        };
 
-        let html = build_delta_html("/posts/hello-world/", &rows);
+        let html = build_delta_html(&ctx, &rows);
         assert!(html.contains(
             r#"<li id="comment-105" class="comment-reply-item" hx-swap-oob="beforeend:#replies-for-101">"#
         ));
         assert!(html.contains(r#"<li id="comment-106" class="comment-item" data-reply-count="1">"#));
-        assert!(html.contains(">1 条回复</span>"));
+        assert!(html.contains(r#"data-i18n="reply-count">1 reply</span>"#));
+        assert!(html.contains(r#"data-i18n="reply""#));
         assert!(html.contains(r#"<li id="comment-107" class="comment-reply-item">"#));
         assert!(!html.contains(r#"hx-swap-oob="beforeend:#replies-for-106""#));
     }
@@ -1368,12 +1626,38 @@ mod tests {
             make_row(102, Some(101), Some("Alice"), "Bob", "<p>Old</p>", 1732123500),
             make_row(103, Some(101), Some("Bob"), "Carol", "<p>Mid</p>", 1732123550),
         ];
-        let older = build_thread_replies_html("/posts/hello-world/", 101, &rows, true, false);
+        let ctx = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::En,
+            query_lang: Some(Locale::Ja),
+        };
+        let older = build_thread_replies_html(&ctx, 101, &rows, true, false);
         assert!(older.starts_with(r#"<li id="load-older-replies-101""#));
-        assert!(older.contains("parent_id=101&amp;before=102"));
+        assert!(older.contains("parent_id=101&amp;before=102&amp;lang=ja"));
 
-        let newer = build_thread_replies_html("/posts/hello-world/", 101, &rows, false, true);
-        assert!(newer.ends_with(r##"<li id="load-newer-replies-101" class="load-more-replies"><button type="button" class="load-replies-btn" hx-get="/api/comments?slug=%2Fposts%2Fhello-world%2F&amp;parent_id=101&amp;after=103" hx-target="#load-newer-replies-101" hx-swap="outerHTML">加载更多回复</button></li>"##));
+        let newer = build_thread_replies_html(&ctx, 101, &rows, false, true);
+        assert!(newer.ends_with(r##"<li id="load-newer-replies-101" class="load-more-replies"><button type="button" class="load-replies-btn" data-i18n="load-newer-replies" hx-get="/api/comments?slug=%2Fposts%2Fhello-world%2F&amp;parent_id=101&amp;after=103&amp;lang=ja" hx-target="#load-newer-replies-101" hx-swap="outerHTML">Load more replies</button></li>"##));
+    }
+
+    #[test]
+    fn test_locale_parsing_and_accept_language() {
+        assert_eq!(Locale::parse("en-US"), Some(Locale::En));
+        assert_eq!(Locale::parse("zh_CN"), Some(Locale::ZhCn));
+        assert_eq!(Locale::parse("zh-Hans"), Some(Locale::ZhCn));
+        assert_eq!(Locale::parse("zh-TW"), Some(Locale::ZhTw));
+        assert_eq!(Locale::parse("zh-HK"), Some(Locale::ZhTw));
+        assert_eq!(Locale::parse("ja-JP"), Some(Locale::Ja));
+        assert_eq!(Locale::parse("fr-FR"), None);
+
+        assert_eq!(
+            Locale::from_accept_language("fr-CH, ja;q=0.8, en-US;q=0.9"),
+            Some(Locale::En)
+        );
+        assert_eq!(
+            Locale::from_accept_language("zh-TW, zh-CN;q=0.8"),
+            Some(Locale::ZhTw)
+        );
+        assert_eq!(Locale::from_accept_language("de-DE;q=0.9"), None);
     }
 
     #[test]
