@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-use ammonia::clean;
+use ammonia::{clean, Builder as AmmoniaBuilder};
 use pulldown_cmark::{html::push_html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use worker::wasm_bindgen::JsValue;
@@ -9,14 +9,17 @@ use worker::*;
 
 const MAX_AUTHOR_CHARS: usize = 50;
 const MAX_CONTENT_CHARS: usize = 2500;
+const MAX_TG_EXCERPT_CHARS: usize = 2000;
 
 const DEFAULT_EXPORT_LIMIT: usize = 20;
 const DEFAULT_EXPORT_MAX_LIMIT: usize = 100;
 const DEFAULT_EXPORT_MAX_BYTES: usize = 32 * 1024;
+const DEFAULT_EXPORT_CACHE_MAX_AGE: usize = 60;
 const INITIAL_INLINE_REPLIES: usize = 5;
 const HISTORY_REPLIES_PREVIEW_LIMIT: usize = 5;
 const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
+const DEFAULT_ADMIN_DISPLAY_NAME: &str = "Admin";
 
 #[derive(Debug, Clone, Deserialize)]
 struct CommentRow {
@@ -26,6 +29,8 @@ struct CommentRow {
     parent_id: Option<i64>,
     reply_to_author: Option<String>,
     author: String,
+    #[serde(default)]
+    is_admin: i64,
     content_html: String,
     created_at: i64,
     #[allow(dead_code)]
@@ -42,11 +47,12 @@ struct ExportResponse {
     has_more: bool,
     exported_count: usize,
     html_bytes: usize,
+    baked_at: i64,
     html: String,
 }
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let origin = req.headers().get("Origin").ok().flatten();
     let req_headers = req
         .headers()
@@ -62,10 +68,11 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return handle_preflight(allowed_origin.as_deref(), req_headers.as_deref());
     }
 
-    let resp = Router::new()
+    let resp = Router::with_data(ctx)
         .get_async("/api/comments/export", handle_export)
         .get_async("/api/comments", handle_get_comments)
         .post_async("/api/comments", handle_post_comment)
+        .post_async("/api/comments/tg-webhook", handle_tg_webhook)
         .run(req, env)
         .await?;
 
@@ -73,8 +80,9 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 /// `GET /api/comments/export?slug=/posts/xxx/&limit=20&max_bytes=32768`
-/// Exports the latest comments within the item limit and forced byte circuit breaker.
-async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+/// Exports the latest comments within the item limit and forced byte circuit breaker,
+/// utilizing Cloudflare's Cache API with `Cache-Control: public, max-age=<ttl>`.
+async fn handle_export(req: Request, ctx: RouteContext<Context>) -> Result<Response> {
     let url = req.url()?;
     let Some(slug) = query_param(&url, "slug").and_then(|s| normalize_slug(&s)) else {
         return Response::error("Missing or invalid 'slug' query parameter", 400);
@@ -102,8 +110,18 @@ async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         Err(msg) => return Response::error(msg, 400),
     };
 
-    let db = ctx.env.d1("DB")?;
     let (locale, query_lang) = resolve_request_locale(&req, &url, None, &ctx.env);
+    let cache_max_age =
+        env_usize_allowing_zero(&ctx.env, "EXPORT_CACHE_MAX_AGE", DEFAULT_EXPORT_CACHE_MAX_AGE);
+    let cache_key = build_export_cache_key(&slug, locale, limit, max_bytes);
+
+    if cache_max_age > 0 {
+        if let Ok(Some(cached)) = Cache::default().get(&cache_key, false).await {
+            return Ok(cached);
+        }
+    }
+
+    let db = ctx.env.d1("DB")?;
     let render_ctx = RenderCtx {
         slug: &slug,
         locale,
@@ -124,14 +142,34 @@ async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         }
     }
 
+    let baked_at = (Date::now().as_millis() / 1000) as i64;
     let export = build_export_package(
         &render_ctx,
         &roots_desc,
         &replies_desc_by_root,
         limit,
         max_bytes,
+        baked_at,
     );
-    Response::from_json(&export)
+    let json_body = serde_json::to_string(&export)
+        .map_err(|e| Error::RustError(format!("Failed to serialize export payload: {e}")))?;
+
+    let cache_control = if cache_max_age > 0 {
+        format!("public, max-age={cache_max_age}")
+    } else {
+        "no-store".to_string()
+    };
+
+    let resp = build_json_response(&json_body, &cache_control)?;
+    if cache_max_age > 0 {
+        if let Ok(cache_resp) = build_json_response(&json_body, &cache_control) {
+            ctx.data.wait_until(async move {
+                let _ = Cache::default().put(&cache_key, cache_resp).await;
+            });
+        }
+    }
+
+    Ok(resp)
 }
 
 /// `GET /api/comments`
@@ -139,7 +177,7 @@ async fn handle_export(req: Request, ctx: RouteContext<()>) -> Result<Response> 
 /// - `?slug=...&after=101` (runtime delta of newer comments; `204` if empty)
 /// - `?slug=...&before=85&limit=20` (user-triggered HTMX loading of older top-level threads)
 /// - `?slug=...&parent_id=101&before=112` / `&after=112` (user-triggered HTMX reply pagination)
-async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn handle_get_comments(req: Request, ctx: RouteContext<Context>) -> Result<Response> {
     let url = req.url()?;
     let Some(slug) = query_param(&url, "slug").and_then(|s| normalize_slug(&s)) else {
         return Response::error("Missing or invalid 'slug' query parameter", 400);
@@ -187,7 +225,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         let html = if let Some(before_id) = before {
             let mut rows_desc = db
                 .prepare(
-                    "SELECT id, slug, parent_id, reply_to_author, author, content_html, created_at, status \
+                    "SELECT id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status \
                      FROM comments \
                      WHERE slug = ?1 AND status = 1 AND parent_id = ?2 AND id < ?3 \
                      ORDER BY id DESC LIMIT ?4",
@@ -209,7 +247,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         } else if let Some(after_id) = after {
             let mut rows_asc = db
                 .prepare(
-                    "SELECT id, slug, parent_id, reply_to_author, author, content_html, created_at, status \
+                    "SELECT id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status \
                      FROM comments \
                      WHERE slug = ?1 AND status = 1 AND parent_id = ?2 AND id > ?3 \
                      ORDER BY id ASC LIMIT ?4",
@@ -230,7 +268,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
         } else {
             let mut rows_asc = db
                 .prepare(
-                    "SELECT id, slug, parent_id, reply_to_author, author, content_html, created_at, status \
+                    "SELECT id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status \
                      FROM comments \
                      WHERE slug = ?1 AND status = 1 AND parent_id = ?2 \
                      ORDER BY id ASC LIMIT ?3",
@@ -283,7 +321,7 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
     let after_id = after.unwrap_or(0);
     let rows: Vec<CommentRow> = db
         .prepare(
-            "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.content_html, c.created_at, c.status, \
+            "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.is_admin, c.content_html, c.created_at, c.status, \
                     CASE WHEN c.parent_id IS NULL THEN \
                       (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id AND r.status = 1) \
                     ELSE 0 END AS reply_count \
@@ -330,8 +368,17 @@ async fn handle_get_comments(req: Request, ctx: RouteContext<()>) -> Result<Resp
 }
 
 /// `POST /api/comments`
-/// Validates honeypot, sanitizes Markdown, persists to D1, and returns the rendered `<li>`.
-async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+/// Enforces optional rate limiting, honeypot, reserved admin name protection,
+/// sanitizes Markdown, persists to D1, dispatches async Telegram notification, and returns `<li>`.
+async fn handle_post_comment(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
+    let url = req.url()?;
+    if !check_rate_limit(&req, &ctx.env).await {
+        let (locale, _) = resolve_request_locale(&req, &url, None, &ctx.env);
+        let mut resp = Response::error(locale.err_rate_limited(), 429)?;
+        resp.headers_mut().set("Retry-After", "60")?;
+        return Ok(resp);
+    }
+
     let is_htmx = req
         .headers()
         .get("HX-Request")?
@@ -350,6 +397,9 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         }
     }
 
+    let form_lang = form_field(&form, "lang");
+    let (locale, query_lang) = resolve_request_locale(&req, &url, form_lang.as_deref(), &ctx.env);
+
     let Some(slug) = form_field(&form, "slug").and_then(|s| normalize_slug(&s)) else {
         return Response::error("Missing or invalid 'slug'", 400);
     };
@@ -359,6 +409,10 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         .unwrap_or_default();
     if author.is_empty() || author.chars().count() > MAX_AUTHOR_CHARS {
         return Response::error("Author must be between 1 and 50 characters", 400);
+    }
+
+    if is_reserved_admin_name_env(&author, &ctx.env) {
+        return Response::error(locale.err_admin_name_reserved(), 403);
     }
 
     let raw_content = form_field(&form, "content")
@@ -414,44 +468,22 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         None
     };
 
-    let created_at = (Date::now().as_millis() / 1000) as i64;
+    let comment = insert_comment_row(
+        &db,
+        &slug,
+        effective_parent_id,
+        reply_to_author.as_deref(),
+        &author,
+        false,
+        &content_html,
+    )
+    .await?;
 
-    let parent_js = match effective_parent_id {
-        Some(pid) => JsValue::from_f64(pid as f64),
-        None => JsValue::NULL,
-    };
-    let reply_to_js = match &reply_to_author {
-        Some(target) => JsValue::from_str(target),
-        None => JsValue::NULL,
-    };
-
-    let inserted: Option<CommentRow> = db
-        .prepare(
-            "INSERT INTO comments (slug, parent_id, reply_to_author, author, content_html, created_at, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1) \
-             RETURNING id, slug, parent_id, reply_to_author, author, content_html, created_at, status, 0 AS reply_count",
-        )
-        .bind(&[
-            JsValue::from_str(&slug),
-            parent_js,
-            reply_to_js,
-            JsValue::from_str(&author),
-            JsValue::from_str(&content_html),
-            JsValue::from_f64(created_at as f64),
-        ])?
-        .first(None)
-        .await?;
-
-    let url = req.url()?;
-    let form_lang = form_field(&form, "lang");
-    let (locale, query_lang) = resolve_request_locale(&req, &url, form_lang.as_deref(), &ctx.env);
     let render_ctx = RenderCtx {
         slug: &slug,
         locale,
         query_lang,
     };
-
-    let comment = inserted.ok_or_else(|| Error::RustError("Failed to insert comment".into()))?;
 
     let mut html = match comment.parent_id {
         Some(root_id) => render_reply_item(&comment, root_id, false, locale),
@@ -465,6 +497,23 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         }
     }
 
+    if let (Some(bot_token), Some(chat_id)) = (
+        secret_or_var(&ctx.env, "TELEGRAM_BOT_TOKEN"),
+        secret_or_var(&ctx.env, "TELEGRAM_CHAT_ID"),
+    ) {
+        let site_origin = secret_or_var(&ctx.env, "SITE_ORIGIN");
+        let tg_text = format_tg_notification_html(&comment, &raw_content, site_origin.as_deref());
+        let comment_id = comment.id;
+        let db_async = ctx.env.d1("DB")?;
+        ctx.data.wait_until(async move {
+            if let Ok(Some(msg_id)) =
+                tg_send_message(&bot_token, &chat_id, &tg_text, Some("HTML"), None).await
+            {
+                let _ = update_comment_tg_message_id(&db_async, comment_id, msg_id).await;
+            }
+        });
+    }
+
     let mut response = Response::from_html(html)?;
     if let Some(root_id) = comment.parent_id {
         let headers = response.headers_mut();
@@ -472,6 +521,725 @@ async fn handle_post_comment(mut req: Request, ctx: RouteContext<()>) -> Result<
         headers.set("HX-Reswap", "beforeend")?;
     }
     Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUpdate {
+    message: Option<TgMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgMessage {
+    message_id: i64,
+    chat: TgChat,
+    from: Option<TgUser>,
+    text: Option<String>,
+    caption: Option<String>,
+    reply_to_message: Option<Box<TgReplyMessage>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgReplyMessage {
+    message_id: i64,
+    text: Option<String>,
+    caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgChat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUser {
+    #[serde(default)]
+    is_bot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgCommentLookup {
+    id: i64,
+    slug: String,
+    parent_id: Option<i64>,
+    author: String,
+    status: i64,
+}
+
+/// `POST /api/comments/tg-webhook`
+/// Authenticated via `X-Telegram-Bot-Api-Secret-Token` and `TELEGRAM_CHAT_ID`.
+/// Supports replying to comment notifications (`/hide`, `/del`, `/show`, or reply text)
+/// and creating new top-level admin comments via `/post <slug> <content>`.
+async fn handle_tg_webhook(mut req: Request, ctx: RouteContext<Context>) -> Result<Response> {
+    let Some(expected_secret) = secret_or_var(&ctx.env, "TELEGRAM_WEBHOOK_SECRET") else {
+        return Response::error("Webhook secret not configured", 403);
+    };
+    let provided_secret = req
+        .headers()
+        .get("X-Telegram-Bot-Api-Secret-Token")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !constant_time_eq(expected_secret.as_bytes(), provided_secret.as_bytes()) {
+        return Response::error("Forbidden", 403);
+    }
+
+    let update: TgUpdate = match req.json().await {
+        Ok(u) => u,
+        Err(_) => return Response::error("Invalid JSON payload", 400),
+    };
+
+    let Some(msg) = update.message else {
+        return Response::ok("ignored");
+    };
+    if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(false) {
+        return Response::ok("ignored");
+    }
+
+    let Some(auth_chat_id) =
+        secret_or_var(&ctx.env, "TELEGRAM_CHAT_ID").and_then(|s| s.parse::<i64>().ok())
+    else {
+        return Response::ok("ignored");
+    };
+    if msg.chat.id != auth_chat_id {
+        return Response::ok("ignored");
+    }
+
+    let Some(bot_token) = secret_or_var(&ctx.env, "TELEGRAM_BOT_TOKEN") else {
+        return Response::ok("ignored");
+    };
+    let chat_id_str = auth_chat_id.to_string();
+
+    let raw_text = msg
+        .text
+        .as_deref()
+        .or(msg.caption.as_deref())
+        .unwrap_or("")
+        .trim();
+    if raw_text.is_empty() {
+        return Response::ok("ignored");
+    }
+
+    let db = ctx.env.d1("DB")?;
+    let admin_author = secret_or_var(&ctx.env, "ADMIN_DISPLAY_NAME")
+        .unwrap_or_else(|| DEFAULT_ADMIN_DISPLAY_NAME.to_string());
+
+    match parse_tg_action(raw_text, msg.reply_to_message.is_some()) {
+        TgAction::Help => {
+            let help_msg = "可用指令：\n\
+                • 引用通知直接回复文本：发布博主回复\n\
+                • 引用通知回复 /hide 或 /del：隐藏评论\n\
+                • 引用通知回复 /show：恢复显示评论\n\
+                • /post /posts/xxx/ 内容：在指定文章发布顶级评论";
+            let _ = tg_send_message(
+                &bot_token,
+                &chat_id_str,
+                help_msg,
+                None,
+                Some(msg.message_id),
+            )
+            .await;
+        }
+        TgAction::PostInvalid => {
+            let _ = tg_send_message(
+                &bot_token,
+                &chat_id_str,
+                "⚠️ 用法: /post /posts/xxx/ 评论内容",
+                None,
+                Some(msg.message_id),
+            )
+            .await;
+        }
+        TgAction::Post {
+            slug: raw_slug,
+            content,
+        } => {
+            let Some(slug) = normalize_slug(raw_slug) else {
+                let _ = tg_send_message(
+                    &bot_token,
+                    &chat_id_str,
+                    "⚠️ 无效的文章路径，示例: /post /posts/hello-world/ 你好",
+                    None,
+                    Some(msg.message_id),
+                )
+                .await;
+                return Response::ok("ok");
+            };
+            if content.chars().count() > MAX_CONTENT_CHARS {
+                let _ = tg_send_message(
+                    &bot_token,
+                    &chat_id_str,
+                    "⚠️ 评论内容超过 2500 字上限",
+                    None,
+                    Some(msg.message_id),
+                )
+                .await;
+                return Response::ok("ok");
+            }
+            let content_html = markdown_to_safe_html(content);
+            if content_html.trim().is_empty() {
+                let _ = tg_send_message(
+                    &bot_token,
+                    &chat_id_str,
+                    "⚠️ 评论内容在清洗后为空",
+                    None,
+                    Some(msg.message_id),
+                )
+                .await;
+                return Response::ok("ok");
+            }
+
+            let created = insert_comment_row(
+                &db,
+                &slug,
+                None,
+                None,
+                &admin_author,
+                true,
+                &content_html,
+            )
+            .await?;
+
+            let confirm = format!(
+                "✅ 已发布评论 #{} [#{id}]\n文章: {}",
+                created.id,
+                slug,
+                id = created.id
+            );
+            if let Ok(Some(confirm_msg_id)) = tg_send_message(
+                &bot_token,
+                &chat_id_str,
+                &confirm,
+                None,
+                Some(msg.message_id),
+            )
+            .await
+            {
+                let _ = update_comment_tg_message_id(&db, created.id, confirm_msg_id).await;
+            }
+        }
+        TgAction::Hide | TgAction::Show | TgAction::Reply { .. } => {
+            let Some(reply_to) = msg.reply_to_message.as_deref() else {
+                return Response::ok("ignored");
+            };
+            let target = find_comment_for_tg_reply(&db, reply_to).await?;
+            let Some(target) = target else {
+                let _ = tg_send_message(
+                    &bot_token,
+                    &chat_id_str,
+                    "⚠️ 未找到对应的评论记录",
+                    None,
+                    Some(msg.message_id),
+                )
+                .await;
+                return Response::ok("ok");
+            };
+
+            match parse_tg_action(raw_text, true) {
+                TgAction::Hide => {
+                    db.prepare("UPDATE comments SET status = 0 WHERE id = ?1")
+                        .bind(&[JsValue::from_f64(target.id as f64)])?
+                        .run()
+                        .await?;
+                    let confirm = format!("✅ 已隐藏评论 #{} [#{id}]", target.id, id = target.id);
+                    let _ = tg_send_message(
+                        &bot_token,
+                        &chat_id_str,
+                        &confirm,
+                        None,
+                        Some(msg.message_id),
+                    )
+                    .await;
+                }
+                TgAction::Show => {
+                    db.prepare("UPDATE comments SET status = 1 WHERE id = ?1")
+                        .bind(&[JsValue::from_f64(target.id as f64)])?
+                        .run()
+                        .await?;
+                    let confirm =
+                        format!("✅ 已恢复显示评论 #{} [#{id}]", target.id, id = target.id);
+                    let _ = tg_send_message(
+                        &bot_token,
+                        &chat_id_str,
+                        &confirm,
+                        None,
+                        Some(msg.message_id),
+                    )
+                    .await;
+                }
+                TgAction::Reply { content } => {
+                    if target.status != 1 {
+                        let warn = format!(
+                            "⚠️ 评论 #{} 当前处于隐藏状态，请先回复 /show 恢复后再回复",
+                            target.id
+                        );
+                        let _ = tg_send_message(
+                            &bot_token,
+                            &chat_id_str,
+                            &warn,
+                            None,
+                            Some(msg.message_id),
+                        )
+                        .await;
+                        return Response::ok("ok");
+                    }
+                    if content.chars().count() > MAX_CONTENT_CHARS {
+                        let _ = tg_send_message(
+                            &bot_token,
+                            &chat_id_str,
+                            "⚠️ 回复内容超过 2500 字上限",
+                            None,
+                            Some(msg.message_id),
+                        )
+                        .await;
+                        return Response::ok("ok");
+                    }
+                    let content_html = markdown_to_safe_html(content);
+                    if content_html.trim().is_empty() {
+                        let _ = tg_send_message(
+                            &bot_token,
+                            &chat_id_str,
+                            "⚠️ 回复内容在清洗后为空",
+                            None,
+                            Some(msg.message_id),
+                        )
+                        .await;
+                        return Response::ok("ok");
+                    }
+
+                    let root_id = target.parent_id.unwrap_or(target.id);
+                    let created = insert_comment_row(
+                        &db,
+                        &target.slug,
+                        Some(root_id),
+                        Some(&target.author),
+                        &admin_author,
+                        true,
+                        &content_html,
+                    )
+                    .await?;
+
+                    let confirm = format!(
+                        "✅ 已发布回复 #{} [#{id}]\n回复 @{}\n文章: {}",
+                        created.id,
+                        target.author,
+                        target.slug,
+                        id = created.id
+                    );
+                    if let Ok(Some(confirm_msg_id)) = tg_send_message(
+                        &bot_token,
+                        &chat_id_str,
+                        &confirm,
+                        None,
+                        Some(msg.message_id),
+                    )
+                    .await
+                    {
+                        let _ = update_comment_tg_message_id(&db, created.id, confirm_msg_id).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+        TgAction::Ignore => {}
+    }
+
+    Response::ok("ok")
+}
+
+async fn insert_comment_row(
+    db: &D1Database,
+    slug: &str,
+    effective_parent_id: Option<i64>,
+    reply_to_author: Option<&str>,
+    author: &str,
+    is_admin: bool,
+    content_html: &str,
+) -> Result<CommentRow> {
+    let created_at = (Date::now().as_millis() / 1000) as i64;
+    let parent_js = match effective_parent_id {
+        Some(pid) => JsValue::from_f64(pid as f64),
+        None => JsValue::NULL,
+    };
+    let reply_to_js = match reply_to_author {
+        Some(target) => JsValue::from_str(target),
+        None => JsValue::NULL,
+    };
+    let is_admin_val = if is_admin { 1.0 } else { 0.0 };
+
+    let inserted: Option<CommentRow> = db
+        .prepare(
+            "INSERT INTO comments (slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1) \
+             RETURNING id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status, 0 AS reply_count",
+        )
+        .bind(&[
+            JsValue::from_str(slug),
+            parent_js,
+            reply_to_js,
+            JsValue::from_str(author),
+            JsValue::from_f64(is_admin_val),
+            JsValue::from_str(content_html),
+            JsValue::from_f64(created_at as f64),
+        ])?
+        .first(None)
+        .await?;
+
+    inserted.ok_or_else(|| Error::RustError("Failed to insert comment".into()))
+}
+
+async fn update_comment_tg_message_id(
+    db: &D1Database,
+    comment_id: i64,
+    tg_message_id: i64,
+) -> Result<()> {
+    db.prepare("UPDATE comments SET tg_message_id = ?1 WHERE id = ?2")
+        .bind(&[
+            JsValue::from_f64(tg_message_id as f64),
+            JsValue::from_f64(comment_id as f64),
+        ])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+async fn find_comment_for_tg_reply(
+    db: &D1Database,
+    reply_to: &TgReplyMessage,
+) -> Result<Option<TgCommentLookup>> {
+    let by_msg: Option<TgCommentLookup> = db
+        .prepare(
+            "SELECT id, slug, parent_id, author, status \
+             FROM comments WHERE tg_message_id = ?1 LIMIT 1",
+        )
+        .bind(&[JsValue::from_f64(reply_to.message_id as f64)])?
+        .first(None)
+        .await?;
+    if by_msg.is_some() {
+        return Ok(by_msg);
+    }
+
+    let fallback_text = reply_to
+        .text
+        .as_deref()
+        .or(reply_to.caption.as_deref())
+        .unwrap_or("");
+    if let Some(cid) = extract_comment_id_tag(fallback_text) {
+        return db
+            .prepare(
+                "SELECT id, slug, parent_id, author, status \
+                 FROM comments WHERE id = ?1 LIMIT 1",
+            )
+            .bind(&[JsValue::from_f64(cid as f64)])?
+            .first(None)
+            .await;
+    }
+
+    Ok(None)
+}
+
+/// Optional per-IP edge rate limiting using Cloudflare Workers Rate Limiting binding (`COMMENT_RATE_LIMITER`).
+/// Skips safely when the binding is omitted or `CF-Connecting-IP` is absent (e.g. local `wrangler dev`).
+async fn check_rate_limit(req: &Request, env: &Env) -> bool {
+    let Ok(limiter) = env.rate_limiter("COMMENT_RATE_LIMITER") else {
+        return true;
+    };
+    let Some(ip) = req
+        .headers()
+        .get("CF-Connecting-IP")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return true;
+    };
+
+    match limiter.limit(format!("comment:{ip}")).await {
+        Ok(outcome) => outcome.success,
+        Err(_) => true,
+    }
+}
+
+fn secret_or_var(env: &Env, name: &str) -> Option<String> {
+    if let Ok(sec) = env.secret(name) {
+        let val = sec.to_string().trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    if let Ok(var) = env.var(name) {
+        let val = var.to_string().trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn is_reserved_admin_name_env(author: &str, env: &Env) -> bool {
+    let admin_names = secret_or_var(env, "ADMIN_NAMES");
+    let display_name = secret_or_var(env, "ADMIN_DISPLAY_NAME");
+    is_reserved_admin_name(author, admin_names.as_deref(), display_name.as_deref())
+}
+
+fn is_reserved_admin_name(
+    author: &str,
+    admin_names: Option<&str>,
+    admin_display_name: Option<&str>,
+) -> bool {
+    let candidate = author.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    if let Some(list) = admin_names {
+        for entry in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if candidate.eq_ignore_ascii_case(entry) {
+                return true;
+            }
+        }
+    }
+    if let Some(display) = admin_display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        if candidate.eq_ignore_ascii_case(display) {
+            return true;
+        }
+    }
+    false
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TgAction<'a> {
+    Hide,
+    Show,
+    Post { slug: &'a str, content: &'a str },
+    PostInvalid,
+    Reply { content: &'a str },
+    Help,
+    Ignore,
+}
+
+fn parse_tg_action(raw_text: &str, has_reply_to: bool) -> TgAction<'_> {
+    let trimmed = raw_text.trim();
+    if trimmed.is_empty() {
+        return TgAction::Ignore;
+    }
+
+    let (first_tok, rest) = match trimmed.find(char::is_whitespace) {
+        Some(idx) => (&trimmed[..idx], trimmed[idx..].trim()),
+        None => (trimmed, ""),
+    };
+    let cmd = first_tok.split('@').next().unwrap_or(first_tok);
+
+    if cmd.eq_ignore_ascii_case("/post") {
+        if rest.is_empty() {
+            return TgAction::PostInvalid;
+        }
+        return match rest.find(char::is_whitespace) {
+            Some(idx) => {
+                let slug = rest[..idx].trim();
+                let content = rest[idx..].trim();
+                if slug.is_empty() || content.is_empty() {
+                    TgAction::PostInvalid
+                } else {
+                    TgAction::Post { slug, content }
+                }
+            }
+            None => TgAction::PostInvalid,
+        };
+    }
+
+    if (cmd.eq_ignore_ascii_case("/hide") || cmd.eq_ignore_ascii_case("/del"))
+        && rest.is_empty()
+        && has_reply_to
+    {
+        return TgAction::Hide;
+    }
+
+    if cmd.eq_ignore_ascii_case("/show") && rest.is_empty() && has_reply_to {
+        return TgAction::Show;
+    }
+
+    if has_reply_to {
+        return TgAction::Reply { content: trimmed };
+    }
+
+    if cmd.eq_ignore_ascii_case("/start") || cmd.eq_ignore_ascii_case("/help") {
+        return TgAction::Help;
+    }
+
+    TgAction::Ignore
+}
+
+fn extract_comment_id_tag(text: &str) -> Option<i64> {
+    let mut search = text;
+    while let Some(pos) = search.find("[#") {
+        let after = &search[pos + 2..];
+        if let Some(end) = after.find(']') {
+            let digits = &after[..end];
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(id) = digits.parse::<i64>() {
+                    if id > 0 {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        search = &search[pos + 2..];
+    }
+    None
+}
+
+/// Strips raw HTML tags while preserving Markdown characters and safely truncating to `max_chars`,
+/// escaping `<`, `>`, and `&` so Telegram `parse_mode: "HTML"` never fails on user input.
+fn prepare_tg_markdown_excerpt(raw_md: &str, max_chars: usize) -> String {
+    let mut iter = raw_md.trim().chars();
+    let truncated: String = iter.by_ref().take(max_chars).collect();
+    let was_truncated = iter.next().is_some();
+    let cleaned = AmmoniaBuilder::empty().clean(&truncated).to_string();
+    if was_truncated {
+        format!("{cleaned}\n...")
+    } else {
+        cleaned
+    }
+}
+
+fn format_tg_notification_html(
+    comment: &CommentRow,
+    raw_content: &str,
+    site_origin: Option<&str>,
+) -> String {
+    let author = escape_html(&comment.author);
+    let slug_escaped = escape_html(&comment.slug);
+    let location = match site_origin.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(origin) => {
+            let clean_origin = origin.trim_end_matches('/');
+            let full_url = format!("{}{}#comment-{}", clean_origin, comment.slug, comment.id);
+            format!(
+                r#"<a href="{}">{}</a>"#,
+                escape_html(&full_url),
+                slug_escaped
+            )
+        }
+        None => format!("<code>{}</code>", slug_escaped),
+    };
+
+    let reply_ctx = match comment.reply_to_author.as_deref().map(str::trim) {
+        Some(target) if !target.is_empty() => format!(" → @{}", escape_html(target)),
+        _ => String::new(),
+    };
+
+    let excerpt = prepare_tg_markdown_excerpt(raw_content, MAX_TG_EXCERPT_CHARS);
+
+    format!(
+        "💬 <b>新评论</b> <code>[#{id}]</code>\n\
+         <b>作者:</b> {author}{reply_ctx}\n\
+         <b>文章:</b> {location}\n\n\
+         {excerpt}",
+        id = comment.id,
+        author = author,
+        reply_ctx = reply_ctx,
+        location = location,
+        excerpt = excerpt,
+    )
+}
+
+#[derive(Serialize)]
+struct TgLinkPreviewOptions {
+    is_disabled: bool,
+}
+
+#[derive(Serialize)]
+struct TgReplyParameters {
+    message_id: i64,
+}
+
+#[derive(Serialize)]
+struct TgSendMessagePayload<'a> {
+    chat_id: &'a str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'a str>,
+    link_preview_options: TgLinkPreviewOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_parameters: Option<TgReplyParameters>,
+}
+
+#[derive(Deserialize)]
+struct TgSendMessageResponse {
+    ok: bool,
+    result: Option<TgSentMessage>,
+}
+
+#[derive(Deserialize)]
+struct TgSentMessage {
+    message_id: i64,
+}
+
+async fn tg_send_message(
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    parse_mode: Option<&str>,
+    reply_to_message_id: Option<i64>,
+) -> Result<Option<i64>> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let payload = TgSendMessagePayload {
+        chat_id,
+        text,
+        parse_mode,
+        link_preview_options: TgLinkPreviewOptions { is_disabled: true },
+        reply_parameters: reply_to_message_id.map(|id| TgReplyParameters { message_id: id }),
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|e| Error::RustError(format!("Failed to serialize Telegram payload: {e}")))?;
+
+    let headers = Headers::new();
+    headers.set("Content-Type", "application/json")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(&body)));
+
+    let req = Request::new_with_init(&url, &init)?;
+    let mut resp = Fetch::Request(req).send().await?;
+    if resp.status_code() < 200 || resp.status_code() >= 300 {
+        return Ok(None);
+    }
+
+    let parsed: TgSendMessageResponse = resp.json().await?;
+    if parsed.ok {
+        Ok(parsed.result.map(|r| r.message_id))
+    } else {
+        Ok(None)
+    }
+}
+
+fn build_export_cache_key(slug: &str, locale: Locale, limit: usize, max_bytes: usize) -> String {
+    format!(
+        "https://hx-echo.cache/api/comments/export?slug={}&lang={}&limit={}&max_bytes={}",
+        encode_uri_component(slug),
+        locale.code(),
+        limit,
+        max_bytes
+    )
+}
+
+fn build_json_response(json_body: &str, cache_control: &str) -> Result<Response> {
+    let mut resp = Response::ok(json_body)?;
+    let headers = resp.headers_mut();
+    headers.set("Content-Type", "application/json; charset=utf-8")?;
+    headers.set("Cache-Control", cache_control)?;
+    Ok(resp)
 }
 
 async fn fetch_roots_desc(
@@ -483,7 +1251,7 @@ async fn fetch_roots_desc(
     match before_id {
         Some(before) => {
             db.prepare(
-                "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.content_html, c.created_at, c.status, \
+                "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.is_admin, c.content_html, c.created_at, c.status, \
                         (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id AND r.status = 1) AS reply_count \
                  FROM comments c \
                  WHERE c.slug = ?1 AND c.status = 1 AND c.parent_id IS NULL AND c.id < ?2 \
@@ -500,7 +1268,7 @@ async fn fetch_roots_desc(
         }
         None => {
             db.prepare(
-                "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.content_html, c.created_at, c.status, \
+                "SELECT c.id, c.slug, c.parent_id, c.reply_to_author, c.author, c.is_admin, c.content_html, c.created_at, c.status, \
                         (SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id AND r.status = 1) AS reply_count \
                  FROM comments c \
                  WHERE c.slug = ?1 AND c.status = 1 AND c.parent_id IS NULL \
@@ -521,9 +1289,9 @@ async fn fetch_replies_for_roots_desc(
     per_root_limit: usize,
 ) -> Result<Vec<CommentRow>> {
     db.prepare(
-        "SELECT id, slug, parent_id, reply_to_author, author, content_html, created_at, status, 0 AS reply_count \
+        "SELECT id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status, 0 AS reply_count \
          FROM ( \
-           SELECT id, slug, parent_id, reply_to_author, author, content_html, created_at, status, \
+           SELECT id, slug, parent_id, reply_to_author, author, is_admin, content_html, created_at, status, \
                   ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY id DESC) AS rn \
            FROM comments \
            WHERE slug = ?1 AND status = 1 AND parent_id >= ?2 \
@@ -566,6 +1334,18 @@ fn env_usize(env: &Env, name: &str, default: usize) -> usize {
         if val > 0 {
             return val;
         }
+    }
+    default
+}
+
+fn env_usize_allowing_zero(env: &Env, name: &str, default: usize) -> usize {
+    if let Ok(var) = env.var(name) {
+        if let Ok(val) = var.to_string().trim().parse::<usize>() {
+            return val;
+        }
+    }
+    if let Ok(val) = env.object_var::<usize>(name) {
+        return val;
     }
     default
 }
@@ -625,7 +1405,9 @@ fn handle_preflight(
 
 fn with_cors_headers(mut resp: Response, allowed_origin: Option<&str>) -> Result<Response> {
     let headers = resp.headers_mut();
-    headers.set("Cache-Control", "no-store")?;
+    if headers.get("Cache-Control")?.is_none() {
+        headers.set("Cache-Control", "no-store")?;
+    }
     if let Some(origin) = allowed_origin {
         headers.set("Access-Control-Allow-Origin", origin)?;
         headers.set(
@@ -951,6 +1733,33 @@ impl Locale {
             Locale::Ja => "さらに返信を読み込む",
         }
     }
+
+    fn admin_badge_label(self) -> &'static str {
+        match self {
+            Locale::En => "Author",
+            Locale::ZhCn => "博主",
+            Locale::ZhTw => "博主",
+            Locale::Ja => "管理人",
+        }
+    }
+
+    fn err_admin_name_reserved(self) -> &'static str {
+        match self {
+            Locale::En => "This author name is reserved for the site administrator.",
+            Locale::ZhCn => "该昵称为博主保留名称，请更换其他昵称。",
+            Locale::ZhTw => "該暱稱為版主保留名稱，請更換其他暱稱。",
+            Locale::Ja => "この名前は管理者専用のため使用できません。",
+        }
+    }
+
+    fn err_rate_limited(self) -> &'static str {
+        match self {
+            Locale::En => "Too many comments submitted. Please wait a moment and try again.",
+            Locale::ZhCn => "发送过于频繁，请稍后再试。",
+            Locale::ZhTw => "傳送過於頻繁，請稍後再試。",
+            Locale::Ja => "投稿が多すぎます。しばらくしてからもう一度お試しください。",
+        }
+    }
 }
 
 fn resolve_request_locale(
@@ -991,6 +1800,7 @@ fn build_export_package(
     replies_desc_by_root: &BTreeMap<i64, Vec<CommentRow>>,
     limit: usize,
     max_bytes: usize,
+    baked_at: i64,
 ) -> ExportResponse {
     let has_older_roots_in_db = roots_desc.len() > limit;
     let candidates = &roots_desc[..roots_desc.len().min(limit)];
@@ -1002,6 +1812,7 @@ fn build_export_package(
             has_more: false,
             exported_count: 0,
             html_bytes: 0,
+            baked_at,
             html: String::new(),
         };
     }
@@ -1092,6 +1903,7 @@ fn build_export_package(
         has_more,
         exported_count: used_items,
         html_bytes,
+        baked_at,
         html,
     }
 }
@@ -1246,6 +2058,17 @@ fn effective_reply_count(root: &CommentRow, rendered_children_len: usize) -> i64
     root.reply_count.max(rendered_children_len as i64)
 }
 
+fn render_admin_badge(is_admin: i64, locale: Locale) -> String {
+    if is_admin != 0 {
+        format!(
+            r#"<span class="badge-admin" data-i18n="admin-badge">{}</span>"#,
+            locale.admin_badge_label()
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn render_comment_node(
     ctx: &RenderCtx<'_>,
     comment: &CommentRow,
@@ -1255,16 +2078,18 @@ fn render_comment_node(
 ) -> String {
     let author_html = escape_html(&comment.author);
     let author_js = escape_js_single_quoted(&comment.author);
+    let admin_badge = render_admin_badge(comment.is_admin, ctx.locale);
     let reply_count_badge = render_reply_count_span(comment.id, reply_count, false, ctx.locale);
     let reply_label = ctx.locale.reply_label();
 
     let mut out = String::new();
     let _ = write!(
         out,
-        r#"<li id="comment-{id}" class="comment-item" data-reply-count="{reply_count}"><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time>{reply_count_badge}<button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{body}</div><ul id="replies-for-{id}" class="comment-replies">"#,
+        r#"<li id="comment-{id}" class="comment-item" data-reply-count="{reply_count}"><div class="comment-meta"><strong>{author}</strong>{admin_badge}<time data-ts="{ts}">{ts}</time>{reply_count_badge}<button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{body}</div><ul id="replies-for-{id}" class="comment-replies">"#,
         id = comment.id,
         reply_count = reply_count,
         author = author_html,
+        admin_badge = admin_badge,
         ts = comment.created_at,
         reply_count_badge = reply_count_badge,
         author_js = author_js,
@@ -1371,6 +2196,7 @@ fn render_load_newer_replies_item(ctx: &RenderCtx<'_>, root_id: i64, after_id: i
 fn render_reply_item(reply: &CommentRow, root_id: i64, oob: bool, locale: Locale) -> String {
     let author_html = escape_html(&reply.author);
     let author_js = escape_js_single_quoted(&reply.author);
+    let admin_badge = render_admin_badge(reply.is_admin, locale);
     let reply_label = locale.reply_label();
 
     let oob_attr = if oob {
@@ -1387,10 +2213,11 @@ fn render_reply_item(reply: &CommentRow, root_id: i64, oob: bool, locale: Locale
     };
 
     format!(
-        r#"<li id="comment-{id}" class="comment-reply-item"{oob}><div class="comment-meta"><strong>{author}</strong><time data-ts="{ts}">{ts}</time><button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({root_id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{prefix}{body}</div></li>"#,
+        r#"<li id="comment-{id}" class="comment-reply-item"{oob}><div class="comment-meta"><strong>{author}</strong>{admin_badge}<time data-ts="{ts}">{ts}</time><button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget({root_id}, '{author_js}')">{reply_label}</button></div><div class="comment-body">{prefix}{body}</div></li>"#,
         id = reply.id,
         oob = oob_attr,
         author = author_html,
+        admin_badge = admin_badge,
         ts = reply.created_at,
         root_id = root_id,
         author_js = author_js,
@@ -1418,6 +2245,7 @@ mod tests {
             parent_id,
             reply_to_author: reply_to_author.map(str::to_string),
             author: author.to_string(),
+            is_admin: 0,
             content_html: content_html.to_string(),
             created_at,
             status: 1,
@@ -1488,10 +2316,12 @@ mod tests {
             &replies_desc_by_root,
             3,
             DEFAULT_EXPORT_MAX_BYTES,
+            1732124000,
         );
         assert_eq!(pkg.exported_count, 3);
         assert_eq!(pkg.first_cursor, 103);
         assert_eq!(pkg.last_cursor, 105);
+        assert_eq!(pkg.baked_at, 1732124000);
         assert!(pkg.has_more);
         assert!(pkg.html.contains(r#"id="load-older-comments""#));
         assert!(pkg.html.contains("before=103&amp;lang=zh-cn"));
@@ -1522,6 +2352,7 @@ mod tests {
             &replies_desc_by_root,
             20,
             1400,
+            1732124000,
         );
         assert_eq!(pkg.exported_count, 1);
         assert!(pkg.html_bytes <= 1400);
@@ -1539,6 +2370,7 @@ mod tests {
             &replies_desc_by_root,
             20,
             100,
+            1732124000,
         );
         assert_eq!(tiny.exported_count, 0);
         assert_eq!(tiny.html_bytes, 0);
@@ -1571,6 +2403,7 @@ mod tests {
             &replies_desc_by_root,
             3,
             DEFAULT_EXPORT_MAX_BYTES,
+            1732124000,
         );
         assert_eq!(pkg.exported_count, 3);
         assert_eq!(pkg.last_cursor, 105);
@@ -1670,5 +2503,138 @@ mod tests {
         assert!(!is_allowed_loopback_origin("https://evil.example.com"));
         assert!(!is_allowed_loopback_origin("http://localhost:1313/path"));
         assert!(!is_allowed_loopback_origin("not-a-url"));
+    }
+
+    #[test]
+    fn test_admin_badge_rendering_across_locales() {
+        let mut root = make_row(201, None, None, "Kouga", "<p>Hi</p>", 1732124000);
+        root.is_admin = 1;
+        let mut reply = make_row(
+            202,
+            Some(201),
+            Some("Alice"),
+            "Kouga",
+            "<p>Reply</p>",
+            1732124100,
+        );
+        reply.is_admin = 1;
+
+        let ctx_zh = RenderCtx {
+            slug: "/posts/hello-world/",
+            locale: Locale::ZhCn,
+            query_lang: None,
+        };
+        let root_html = render_comment_node(&ctx_zh, &root, &[], 0, 0);
+        assert!(root_html.contains(
+            r#"<strong>Kouga</strong><span class="badge-admin" data-i18n="admin-badge">博主</span>"#
+        ));
+
+        let reply_en = render_reply_item(&reply, 201, false, Locale::En);
+        assert!(reply_en.contains(
+            r#"<strong>Kouga</strong><span class="badge-admin" data-i18n="admin-badge">Author</span>"#
+        ));
+
+        let reply_ja = render_reply_item(&reply, 201, false, Locale::Ja);
+        assert!(reply_ja.contains(
+            r#"<strong>Kouga</strong><span class="badge-admin" data-i18n="admin-badge">管理人</span>"#
+        ));
+
+        let visitor = make_row(203, None, None, "Alice", "<p>Visitor</p>", 1732124200);
+        let visitor_html = render_comment_node(&ctx_zh, &visitor, &[], 0, 0);
+        assert!(!visitor_html.contains("badge-admin"));
+    }
+
+    #[test]
+    fn test_reserved_admin_names() {
+        assert!(is_reserved_admin_name(
+            "kouga",
+            Some("Admin, Kouga"),
+            Some("Owner")
+        ));
+        assert!(is_reserved_admin_name(
+            "  OWNER ",
+            Some("Admin, Kouga"),
+            Some("Owner")
+        ));
+        assert!(!is_reserved_admin_name(
+            "Alice",
+            Some("Admin, Kouga"),
+            Some("Owner")
+        ));
+        assert!(!is_reserved_admin_name("", Some("Admin"), None));
+    }
+
+    #[test]
+    fn test_tg_action_and_id_tag_parsing() {
+        assert_eq!(parse_tg_action("/hide", true), TgAction::Hide);
+        assert_eq!(parse_tg_action("/del@my_bot", true), TgAction::Hide);
+        assert_eq!(parse_tg_action("/show ", true), TgAction::Show);
+        assert_eq!(parse_tg_action("/hide", false), TgAction::Ignore);
+        assert_eq!(
+            parse_tg_action("Thanks for sharing!", true),
+            TgAction::Reply {
+                content: "Thanks for sharing!"
+            }
+        );
+        assert_eq!(
+            parse_tg_action("/post /posts/a/ Line 1\nLine 2", false),
+            TgAction::Post {
+                slug: "/posts/a/",
+                content: "Line 1\nLine 2"
+            }
+        );
+        assert_eq!(
+            parse_tg_action("/post@my_bot /posts/a/", false),
+            TgAction::PostInvalid
+        );
+        assert_eq!(parse_tg_action("/help", false), TgAction::Help);
+
+        assert_eq!(
+            extract_comment_id_tag("💬 新评论 [#42]\n作者: Alice"),
+            Some(42)
+        );
+        assert_eq!(
+            extract_comment_id_tag("✅ 已发布回复 #99 [#99]"),
+            Some(99)
+        );
+        assert_eq!(extract_comment_id_tag("No tag [#abc] here"), None);
+    }
+
+    #[test]
+    fn test_tg_markdown_excerpt_sanitizes_html_and_truncates() {
+        let md = "Hello **world** _test_ <script>alert(1)</script><b>bold</b>\n> quote & a < b";
+        let excerpt = prepare_tg_markdown_excerpt(md, 2000);
+        assert!(excerpt.contains("**world** _test_ bold"));
+        assert!(!excerpt.contains("<script"));
+        assert!(!excerpt.contains("alert(1)"));
+        assert!(!excerpt.contains("<b>"));
+        assert!(excerpt.contains("&gt; quote &amp; a &lt; b"));
+
+        let long = "汉".repeat(2050);
+        let truncated = prepare_tg_markdown_excerpt(&long, 2000);
+        assert!(truncated.ends_with("\n..."));
+        assert_eq!(truncated.chars().count(), 2004);
+    }
+
+    #[test]
+    fn test_tg_notification_formatting_and_constant_time_eq() {
+        let row = make_row(55, Some(10), Some("Alice"), "Bob", "<p>Hi</p>", 1732124000);
+        let with_origin = format_tg_notification_html(&row, "**hello** _world_", Some("https://koa.im/"));
+        assert!(with_origin.contains(r#"<code>[#55]</code>"#));
+        assert!(with_origin.contains(r#"<a href="https://koa.im/posts/hello-world/#comment-55">/posts/hello-world/</a>"#));
+        assert!(with_origin.contains("→ @Alice"));
+        assert!(with_origin.contains("**hello** _world_"));
+
+        assert!(constant_time_eq(b"secret-123", b"secret-123"));
+        assert!(!constant_time_eq(b"secret-123", b"secret-124"));
+        assert!(!constant_time_eq(b"secret-123", b"secret"));
+    }
+
+    #[test]
+    fn test_export_cache_key_is_normalized() {
+        assert_eq!(
+            build_export_cache_key("/posts/hello-world/", Locale::ZhCn, 20, 32768),
+            "https://hx-echo.cache/api/comments/export?slug=%2Fposts%2Fhello-world%2F&lang=zh-cn&limit=20&max_bytes=32768"
+        );
     }
 }

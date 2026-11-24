@@ -1,0 +1,349 @@
+name: Deploy hx-echo
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_name:
+        description: "Cloudflare Worker name"
+        required: true
+        default: "hx-echo"
+        type: string
+      domains:
+        description: "Comma-separated domains for routes (e.g. example.com,www.example.com). Leave empty for workers.dev only"
+        required: false
+        default: ""
+        type: string
+      api_path:
+        description: "API route path suffix mounted on each domain"
+        required: true
+        default: "/api/comments*"
+        type: string
+      d1_database_name:
+        description: "Cloudflare D1 database name (auto-created if missing)"
+        required: true
+        default: "hx-echo-db"
+        type: string
+      d1_database_id:
+        description: "Existing D1 database UUID (optional; auto-resolved/created by name if blank)"
+        required: false
+        default: ""
+        type: string
+      default_lang:
+        description: "Default fallback UI language"
+        required: true
+        default: "en"
+        type: choice
+        options:
+          - en
+          - zh-cn
+          - zh-tw
+          - ja
+      site_origin:
+        description: "Canonical site origin for Telegram links (e.g. https://example.com)"
+        required: false
+        default: ""
+        type: string
+      admin_names:
+        description: "Comma-separated reserved admin author names blocked on web form (403)"
+        required: false
+        default: ""
+        type: string
+      admin_display_name:
+        description: "Display name used when replying or posting via Telegram Bot"
+        required: false
+        default: "Admin"
+        type: string
+      telegram_chat_id:
+        description: "Authorized numeric Telegram chat ID (or store in TELEGRAM_CHAT_ID secret)"
+        required: false
+        default: ""
+        type: string
+      enable_rate_limit:
+        description: "Enable per-IP Cloudflare Workers Rate Limiting binding"
+        required: false
+        default: true
+        type: boolean
+      rate_limit_requests:
+        description: "Max POST requests per IP within the window (when rate limit is enabled)"
+        required: false
+        default: "5"
+        type: string
+      rate_limit_period:
+        description: "Rate limit window in seconds (Cloudflare supports 10 or 60)"
+        required: false
+        default: "60"
+        type: choice
+        options:
+          - "60"
+          - "10"
+      export_cache_max_age:
+        description: "Cache-Control max-age (seconds) for /api/comments/export"
+        required: false
+        default: "60"
+        type: string
+      setup_tg_webhook:
+        description: "Call Telegram setWebhook if TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, and site_origin/domains are set"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Cloudflare credentials
+        id: check_creds
+        shell: bash
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "Skipping automatic deploy: CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID secret is not set."
+              echo "configured=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "::error::Please configure CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in repository Secrets."
+              exit 1
+            fi
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.check_creds.outputs.configured == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Rust toolchain (wasm32-unknown-unknown)
+        if: steps.check_creds.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo and worker-build
+        if: steps.check_creds.outputs.configured == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+
+      - name: Resolve or create D1 database and generate wrangler.toml
+        if: steps.check_creds.outputs.configured == 'true'
+        id: config
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WRANGLER_TOML_SECRET: ${{ secrets.WRANGLER_TOML }}
+          IN_WORKER_NAME: ${{ inputs.worker_name || vars.HX_ECHO_WORKER_NAME || 'hx-echo' }}
+          IN_DOMAINS: ${{ inputs.domains || vars.HX_ECHO_DOMAINS || '' }}
+          IN_API_PATH: ${{ inputs.api_path || vars.HX_ECHO_API_PATH || '/api/comments*' }}
+          IN_DB_NAME: ${{ inputs.d1_database_name || vars.HX_ECHO_D1_DATABASE_NAME || 'hx-echo-db' }}
+          IN_DB_ID: ${{ inputs.d1_database_id || vars.HX_ECHO_D1_DATABASE_ID || '' }}
+          IN_DEFAULT_LANG: ${{ inputs.default_lang || vars.HX_ECHO_DEFAULT_LANG || 'en' }}
+          IN_SITE_ORIGIN: ${{ inputs.site_origin || vars.HX_ECHO_SITE_ORIGIN || '' }}
+          IN_ADMIN_NAMES: ${{ inputs.admin_names || vars.HX_ECHO_ADMIN_NAMES || '' }}
+          IN_ADMIN_DISPLAY_NAME: ${{ inputs.admin_display_name || vars.HX_ECHO_ADMIN_DISPLAY_NAME || 'Admin' }}
+          IN_TG_CHAT_ID: ${{ inputs.telegram_chat_id || vars.HX_ECHO_TELEGRAM_CHAT_ID || '' }}
+          IN_ENABLE_RL: ${{ inputs.enable_rate_limit || vars.HX_ECHO_ENABLE_RATE_LIMIT || 'true' }}
+          IN_RL_LIMIT: ${{ inputs.rate_limit_requests || vars.HX_ECHO_RATE_LIMIT_REQUESTS || '5' }}
+          IN_RL_PERIOD: ${{ inputs.rate_limit_period || vars.HX_ECHO_RATE_LIMIT_PERIOD || '60' }}
+          IN_EXPORT_CACHE_MAX_AGE: ${{ inputs.export_cache_max_age || vars.HX_ECHO_EXPORT_CACHE_MAX_AGE || '60' }}
+        run: |
+          if [ -n "$WRANGLER_TOML_SECRET" ] && [ "$EVENT_NAME" = "push" ]; then
+            printf '%s\n' "$WRANGLER_TOML_SECRET" > wrangler.toml
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "push" ] && [ -z "$IN_DB_ID" ] && [ -z "$IN_DOMAINS" ]; then
+            echo "Skipping push deploy: neither WRANGLER_TOML secret nor HX_ECHO_* variables are configured. Run 'Deploy hx-echo' via workflow_dispatch first."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$IN_DB_ID" ]; then
+            echo "Resolving D1 database ID for '$IN_DB_NAME'..."
+            DB_LIST_JSON="$(npx --yes wrangler@latest d1 list --json)"
+            IN_DB_ID="$(DB_NAME="$IN_DB_NAME" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+name = os.environ["DB_NAME"]
+for item in data:
+    if item.get("name") == name:
+        print(item.get("uuid") or item.get("id") or "")
+        break
+' <<< "$DB_LIST_JSON")"
+            if [ -z "$IN_DB_ID" ]; then
+              echo "Creating D1 database '$IN_DB_NAME'..."
+              CREATE_OUT="$(npx --yes wrangler@latest d1 create "$IN_DB_NAME")"
+              echo "$CREATE_OUT"
+              IN_DB_ID="$(python3 -c '
+import re, sys
+text = sys.stdin.read()
+m = re.search(r"database_id\s*=\s*\"([0-9a-fA-F-]+)\"", text)
+if not m:
+    m = re.search(r"\"uuid\"\s*:\s*\"([0-9a-fA-F-]+)\"", text)
+print(m.group(1) if m else "")
+' <<< "$CREATE_OUT")"
+            fi
+          fi
+
+          if [ -z "$IN_DB_ID" ]; then
+            echo "::error::Failed to resolve or create D1 database ID."
+            exit 1
+          fi
+
+          export RESOLVED_DB_ID="$IN_DB_ID"
+          python3 - <<'PY'
+import json, os
+
+def toml_str(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False)
+
+worker_name = os.environ["IN_WORKER_NAME"].strip() or "hx-echo"
+api_path = "/" + os.environ["IN_API_PATH"].strip().lstrip("/")
+db_name = os.environ["IN_DB_NAME"].strip() or "hx-echo-db"
+db_id = os.environ["RESOLVED_DB_ID"].strip()
+domains = [d.strip().rstrip("/") for d in os.environ["IN_DOMAINS"].split(",") if d.strip()]
+
+lines = [
+    f"name = {toml_str(worker_name)}",
+    'main = "build/worker/shim.mjs"',
+    'compatibility_date = "2025-01-01"',
+    "",
+    "[build]",
+    'command = "cargo install -q worker-build && worker-build --release"',
+    "",
+    "[[d1_databases]]",
+    'binding = "DB"',
+    f"database_name = {toml_str(db_name)}",
+    f"database_id = {toml_str(db_id)}",
+    'migrations_dir = "migrations"',
+    "",
+]
+
+if domains:
+    lines.append("routes = [")
+    for entry in domains:
+        if ":" in entry:
+            d, zone = [x.strip() for x in entry.split(":", 1)]
+        else:
+            d = entry
+            parts = d.split(".")
+            zone = ".".join(parts[-2:]) if len(parts) >= 2 else d
+        lines.append(f'  {{ pattern = {toml_str(d + api_path)}, zone_name = {toml_str(zone)} }},')
+    lines.append("]")
+    lines.append("")
+
+if os.environ.get("IN_ENABLE_RL", "true").lower() == "true":
+    rl_limit = int(os.environ.get("IN_RL_LIMIT", "5") or "5")
+    rl_period = int(os.environ.get("IN_RL_PERIOD", "60") or "60")
+    if rl_period not in (10, 60):
+        rl_period = 60
+    lines.extend([
+        "[[ratelimits]]",
+        'name = "COMMENT_RATE_LIMITER"',
+        'namespace_id = "1001"',
+        "",
+        "  [ratelimits.simple]",
+        f"  limit = {rl_limit}",
+        f"  period = {rl_period}",
+        "",
+    ])
+
+lines.extend([
+    "[vars]",
+    f"DEFAULT_LANG = {toml_str(os.environ['IN_DEFAULT_LANG'].strip() or 'en')}",
+    'EXPORT_DEFAULT_LIMIT = "20"',
+    'EXPORT_MAX_LIMIT = "100"',
+    'EXPORT_MAX_BYTES = "32768"',
+    f"EXPORT_CACHE_MAX_AGE = {toml_str(os.environ['IN_EXPORT_CACHE_MAX_AGE'].strip() or '60')}",
+])
+
+optional_vars = [
+    ("SITE_ORIGIN", os.environ.get("IN_SITE_ORIGIN", "").strip().rstrip("/")),
+    ("ADMIN_NAMES", os.environ.get("IN_ADMIN_NAMES", "").strip()),
+    ("ADMIN_DISPLAY_NAME", os.environ.get("IN_ADMIN_DISPLAY_NAME", "").strip()),
+    ("TELEGRAM_CHAT_ID", os.environ.get("IN_TG_CHAT_ID", "").strip()),
+]
+for k, v in optional_vars:
+    if v:
+        lines.append(f"{k} = {toml_str(v)}")
+
+with open("wrangler.toml", "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+
+print(f"Generated wrangler.toml for worker={worker_name}, db={db_name} ({db_id}), routes={len(domains)}")
+PY
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        if: steps.config.outputs.ready == 'true'
+        run: cargo test
+
+      - name: Apply D1 database migrations
+        if: steps.config.outputs.ready == 'true'
+        run: npx --yes wrangler@latest d1 migrations apply DB --remote
+
+      - name: Sync Worker secrets (if configured in GitHub Secrets)
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          TG_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TG_BOT_TOKEN" ]; then
+            printf '%s' "$TG_BOT_TOKEN" | npx --yes wrangler@latest secret put TELEGRAM_BOT_TOKEN
+          fi
+          if [ -n "$TG_WEBHOOK_SECRET" ]; then
+            printf '%s' "$TG_WEBHOOK_SECRET" | npx --yes wrangler@latest secret put TELEGRAM_WEBHOOK_SECRET
+          fi
+          if [ -n "$TG_CHAT_ID_SECRET" ]; then
+            printf '%s' "$TG_CHAT_ID_SECRET" | npx --yes wrangler@latest secret put TELEGRAM_CHAT_ID
+          fi
+
+      - name: Deploy Worker
+        if: steps.config.outputs.ready == 'true'
+        run: npx --yes wrangler@latest deploy
+
+      - name: Register Telegram Webhook (optional)
+        if: steps.config.outputs.ready == 'true' && github.event_name == 'workflow_dispatch' && inputs.setup_tg_webhook == true
+        shell: bash
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          SETUP_HOOK: ${{ inputs.setup_tg_webhook }}
+          IN_SITE_ORIGIN: ${{ inputs.site_origin || vars.HX_ECHO_SITE_ORIGIN || '' }}
+          IN_DOMAINS: ${{ inputs.domains || vars.HX_ECHO_DOMAINS || '' }}
+        run: |
+          if [ "$SETUP_HOOK" != "true" ] || [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_WEBHOOK_SECRET" ]; then
+            exit 0
+          fi
+          BASE_ORIGIN="${IN_SITE_ORIGIN%/}"
+          if [ -z "$BASE_ORIGIN" ] && [ -n "$IN_DOMAINS" ]; then
+            FIRST_DOMAIN="$(echo "$IN_DOMAINS" | cut -d',' -f1 | xargs)"
+            if [ -n "$FIRST_DOMAIN" ]; then
+              BASE_ORIGIN="https://${FIRST_DOMAIN}"
+            fi
+          fi
+          if [ -z "$BASE_ORIGIN" ]; then
+            echo "Skipping setWebhook: neither site_origin nor domains was provided."
+            exit 0
+          fi
+          WEBHOOK_URL="${BASE_ORIGIN}/api/comments/tg-webhook"
+          echo "Registering Telegram webhook to $WEBHOOK_URL"
+          curl -fsSL -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\":\"${WEBHOOK_URL}\",\"secret_token\":\"${TG_WEBHOOK_SECRET}\"}"
+          echo ""

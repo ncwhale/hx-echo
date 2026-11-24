@@ -8,10 +8,10 @@
 
 ## 1. System Architecture & Data Flow
 
-### 1.1 Build-Time Baseline (Hugo SSG)
+### 1.1 Build-Time Baseline (Hugo SSG & Edge Cache)
 1. During `hugo --minify`, Hugo invokes `resources.GetRemote` targeting `GET /api/comments/export?slug={RelPermalink}&lang={lang}`.
-2. The Rust Worker queries D1 for approved comments (`status = 1`) for the normalized `slug`, packs the newest root comments and up to `INITIAL_INLINE_REPLIES` (5) replies per root within both item limits (`EXPORT_DEFAULT_LIMIT` / `EXPORT_MAX_LIMIT`) and a forced UTF-8 byte circuit breaker (`EXPORT_MAX_BYTES`, default 32 KiB).
-3. It returns JSON containing `{ "lastCursor": <max_id>, "firstCursor": <oldest_root_id>, "hasMore": bool, "exportedCount": n, "htmlBytes": n, "html": "..." }`.
+2. The Rust Worker checks Cloudflare's Cache API (`Cache::default()` using a normalized cache key on `slug`, `lang`, `limit`, `max_bytes`). On a miss, it queries D1 for approved comments (`status = 1`), packs the newest root comments and up to `INITIAL_INLINE_REPLIES` (5) replies per root within both item limits (`EXPORT_DEFAULT_LIMIT` / `EXPORT_MAX_LIMIT`) and a forced UTF-8 byte circuit breaker (`EXPORT_MAX_BYTES`, default 32 KiB).
+3. It returns JSON containing `{ "lastCursor": <max_id>, "firstCursor": <oldest_root_id>, "hasMore": bool, "exportedCount": n, "htmlBytes": n, "bakedAt": <unix_ts>, "html": "..." }` with `Cache-Control: public, max-age=60` (configurable via `EXPORT_CACHE_MAX_AGE`). No active cache purge is required when new comments arrive because runtime delta (`GET /api/comments?after=<lastCursor>`) automatically backfills everything newer than the cached baseline.
 4. Hugo embeds `html` directly into the static page and sets `after={{ $lastCursor }}` on `#comment-list`.
 5. **Graceful Degradation**: Wrapped in `try (...)` so network hiccups, offline builds, or uninitialized deployments fall back safely to `lastCursor = 0` and empty HTML without breaking CI/CD builds.
 
@@ -29,14 +29,19 @@
 - When build-time export or thread replies are truncated, `hx-echo` emits HTMX trigger items (`#load-older-comments`, `#load-older-replies-<root_id>`, `#load-newer-replies-<root_id>`).
 - Clicking these buttons hits `GET /api/comments?slug=...&before=<id>` or `GET /api/comments?slug=...&parent_id=<root_id>&before|after=<id>` and replaces the trigger item with `hx-swap="outerHTML"`.
 
-### 1.4 Comment Submission (Mutation)
+### 1.4 Comment Submission, Rate Limiting & Telegram Bidirectional Loop
 1. A single reusable `<form id="comment-form">` submits via `hx-post="/api/comments"`.
-2. **Validation & Honeypot Check**: Hidden field `website` must be empty (otherwise returns `204 No Content` silently). `author` is limited to 50 characters and `content` to 2500 characters (`MAX_AUTHOR_CHARS`, `MAX_CONTENT_CHARS`).
-3. **Markdown & XSS Sanitization**: Raw Markdown is parsed via `pulldown-cmark` (strikethrough, tables, tasklists enabled) and sanitized via `ammonia` on the edge before D1 insertion.
-4. **Two-Level Tree Normalization & Dynamic Retargeting**:
+2. **Optional Edge Rate Limiting**: If the `COMMENT_RATE_LIMITER` binding is configured in `wrangler.toml` and `CF-Connecting-IP` is present, requests exceeding the limit receive `429 Too Many Requests` (`Retry-After: 60`) with a localized plain-text message compatible with `#comment-error`.
+3. **Validation, Honeypot & Anti-Impersonation**: Hidden field `website` must be empty (otherwise returns `204 No Content` silently). `author` is limited to 50 characters and `content` to 2500 characters (`MAX_AUTHOR_CHARS`, `MAX_CONTENT_CHARS`). Public submissions matching `ADMIN_NAMES` or `ADMIN_DISPLAY_NAME` (case-insensitive) are rejected with `403 Forbidden` plain text.
+4. **Markdown & XSS Sanitization**: Raw Markdown is parsed via `pulldown-cmark` (strikethrough, tables, tasklists enabled) and sanitized via `ammonia` on the edge before D1 insertion (`is_admin = 0`).
+5. **Two-Level Tree Normalization & Dynamic Retargeting**:
    - `parent_id` is normalized on the server to always point to the root comment ID, while `reply_to_author` preserves `@target` mention context.
    - Top-level comments return the rendered `<li>` and append to `#comment-list`.
    - Child replies return response headers `HX-Retarget: #replies-for-{parent_id}` and `HX-Reswap: beforeend`, plus an OOB `#reply-count-{parent_id}` span update.
+6. **Async Telegram Notification (`ctx.wait_until`)**: When `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, the Worker sends a notification containing the `[#id]` marker, author, clickable article link (`SITE_ORIGIN`), and an HTML-tag-stripped Markdown excerpt (<= 2000 chars) to Telegram, then writes `result.message_id` back to `comments.tg_message_id`.
+7. **Telegram Webhook (`POST /api/comments/tg-webhook`)**: Verified via constant-time `X-Telegram-Bot-Api-Secret-Token == TELEGRAM_WEBHOOK_SECRET` and strict `message.chat.id == TELEGRAM_CHAT_ID` (mismatched chats/bots/non-message updates return `200 OK` and are ignored). Supports:
+   - Replying to a notification (`/hide` or `/del` -> `status = 0`; `/show` -> `status = 1`; any other text -> publishes an `is_admin = 1` reply using `ADMIN_DISPLAY_NAME`).
+   - `/post <slug> <content>` -> publishes a new top-level `is_admin = 1` comment on `<slug>`.
 
 ### 1.5 Multi-Domain Same-Origin Routing & Local Dev CORS
 - **Production Same-Origin**: Mount the Worker via **Cloudflare Routes** on `<domain>/api/comments*` across all mirror domains (both apex and `www.`). Frontend requests use relative `/api/comments` with zero CORS preflights. All API responses set `Cache-Control: no-store`.
@@ -44,8 +49,8 @@
 - **Local Dev CORS**: Requests from loopback origins (`http://localhost[:port]`, `http://127.0.0.1[:port]`, `http://[::1][:port]`) or origins listed in `CORS_ALLOW_ORIGINS` automatically receive `OPTIONS` preflight handling and `Access-Control-Allow-Origin` / `Access-Control-Expose-Headers` (exposing `HX-Retarget`, `HX-Reswap`, `HX-Reselect`, `HX-Trigger`, `HX-Location`, `HX-Push`, etc.).
 
 ### 1.6 Internationalization (i18n)
-- **Built-in Server Locales**: `en` (default), `zh-cn`, `zh-tw`, `ja`, resolved in priority order: `lang` (form/query) > `HX-Lang` header > `Accept-Language` header (weighted by `q`) > `DEFAULT_LANG` env var > `en`. Explicit `?lang=` is preserved in pagination button URLs.
-- **Client-Side Overrides**: Rendered controls and counters include semantic `data-i18n` attributes (`reply`, `reply-count` + `data-count`, `load-older-comments`, `load-older-replies`, `load-older-replies-remaining` + `data-remaining`, `load-replies-total` + `data-total`, `load-newer-replies`) so any static site generator can override labels using its own i18n dictionary.
+- **Built-in Server Locales**: `en` (default), `zh-cn`, `zh-tw`, `ja`, resolved in priority order: `lang` (form/query) > `HX-Lang` header > `Accept-Language` header (weighted by `q`) > `DEFAULT_LANG` env var > `en`. Explicit `?lang=` is preserved in pagination button URLs. Built-in messages also localize `.badge-admin` (`Author` / `博主` / `管理人`), `403` reserved-name errors, and `429` rate-limit errors.
+- **Client-Side Overrides**: Rendered controls and counters include semantic `data-i18n` attributes (`admin-badge`, `reply`, `reply-count` + `data-count`, `load-older-comments`, `load-older-replies`, `load-older-replies-remaining` + `data-remaining`, `load-replies-total` + `data-total`, `load-newer-replies`) so any static site generator can override labels using its own i18n dictionary.
 
 ---
 
@@ -53,22 +58,29 @@
 
 ```text
 hx-echo/
+├── .github/
+│   └── workflows/
+│       └── deploy.yml          # Guided workflow_dispatch + CI/CD deployment workflow
+├── migrations/
+│   ├── 0001_init.sql           # Baseline D1 schema migration
+│   └── 0002_tg_admin.sql       # Adds is_admin, tg_message_id, and idx_comments_tg_msg
 ├── Cargo.toml                  # Rust dependencies & Wasm release size optimizations
-├── wrangler.toml.example       # Template for Cloudflare Worker, D1 binding, routes, and vars
-├── schema.sql                  # D1 SQLite schema & indexes
+├── wrangler.toml.example       # Template for Cloudflare Worker, D1 binding, optional ratelimits, routes, and vars
+├── .dev.vars.example           # Local dev secret placeholders for `wrangler dev`
+├── schema.sql                  # Latest full D1 SQLite schema snapshot & indexes
 ├── LICENSE                     # MIT License
 ├── README.md                   # English documentation & self-hosting guide
 ├── README.zh_CN.md             # Simplified Chinese documentation
 ├── ARCHITECTURE.md             # This file (architecture & integration specification)
 └── src/
-    └── lib.rs                  # Rust Worker entrypoint, router, D1 queries, i18n, HTML renderer & unit tests
+    └── lib.rs                  # Rust Worker entrypoint, router, D1 queries, Telegram loop, i18n, HTML renderer & tests
 ```
 
 ---
 
-## 3. Database Schema (`schema.sql`)
+## 3. Database Schema (`schema.sql` & `migrations/`)
 
-Flat storage with two-level tree normalization (`parent_id` always points to the root comment ID; nested replies track `@target` via `reply_to_author`).
+Flat storage with two-level tree normalization (`parent_id` always points to the root comment ID; nested replies track `@target` via `reply_to_author`), plus `is_admin` and `tg_message_id` for the Telegram moderation loop.
 
 ```sql
 CREATE TABLE IF NOT EXISTS comments (
@@ -77,6 +89,8 @@ CREATE TABLE IF NOT EXISTS comments (
   parent_id INTEGER DEFAULT NULL,     -- NULL = top-level comment; integer = root comment id
   reply_to_author TEXT DEFAULT NULL,  -- Target username for @mention display in nested threads
   author TEXT NOT NULL,
+  is_admin INTEGER DEFAULT 0,         -- 1 = site administrator / author, 0 = visitor
+  tg_message_id INTEGER DEFAULT NULL, -- Telegram message_id for reply matching
   content_html TEXT NOT NULL,         -- Sanitized HTML rendered from Markdown
   created_at INTEGER NOT NULL,        -- Unix timestamp (seconds)
   status INTEGER DEFAULT 1            -- 1 = published, 0 = pending/hidden
@@ -84,7 +98,10 @@ CREATE TABLE IF NOT EXISTS comments (
 
 CREATE INDEX IF NOT EXISTS idx_comments_slug_id ON comments(slug, status, id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent_id ON comments(parent_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_comments_tg_msg ON comments(tg_message_id);
 ```
+
+Versioned migrations live in `migrations/` (`0001_init.sql`, `0002_tg_admin.sql`) and are applied sequentially via `npx wrangler d1 migrations apply DB --remote` (and `--local`).
 
 ---
 
@@ -130,6 +147,7 @@ command = "cargo install -q worker-build && worker-build --release"
 binding = "DB"
 database_name = "hx-echo-db"
 database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
 
 # Mount the same Worker across all mirror domains under /api/comments*
 routes = [
@@ -138,14 +156,39 @@ routes = [
   { pattern = "mirror.example.org/api/comments*", zone_name = "mirror.example.org" }
 ]
 
+# Optional per-IP rate limiting (Wrangler >= 4.36.0; period must be 10 or 60)
+# [[ratelimits]]
+# name = "COMMENT_RATE_LIMITER"
+# namespace_id = "1001"
+#
+#   [ratelimits.simple]
+#   limit = 5
+#   period = 60
+
 [vars]
 DEFAULT_LANG = "en"
 EXPORT_DEFAULT_LIMIT = "20"
 EXPORT_MAX_LIMIT = "100"
 EXPORT_MAX_BYTES = "32768"
+EXPORT_CACHE_MAX_AGE = "60"
+# SITE_ORIGIN = "https://example.com"
+# ADMIN_NAMES = "Admin,YourName"
+# ADMIN_DISPLAY_NAME = "Admin"
+# TELEGRAM_CHAT_ID = "123456789"
 ```
 
-> **Note on Wrangler Environments**: If you separate local dev (`hx-echo-dev`) and production (`[env.production]` with `hx-echo-prod`), remember that `routes`, `d1_databases`, and `vars` are **non-inheritable** in Wrangler and must each be declared under `[env.production]` as well.
+Set Telegram credentials as Worker Secrets (never commit tokens to `[vars]`):
+```sh
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+```
+
+Register the Telegram Webhook (replace `<BOT_TOKEN>`, `<YOUR_DOMAIN>`, and `<WEBHOOK_SECRET>`):
+```sh
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" -H "Content-Type: application/json" -d '{"url":"https://<YOUR_DOMAIN>/api/comments/tg-webhook","secret_token":"<WEBHOOK_SECRET>"}'
+```
+
+> **Note on Wrangler Environments**: If you separate local dev (`hx-echo-dev`) and production (`[env.production]` with `hx-echo-prod`), remember that `routes`, `d1_databases`, `ratelimits`, and `vars` are **non-inheritable** in Wrangler and must each be declared under `[env.production]` as well.
 
 ---
 
@@ -175,12 +218,12 @@ Both build-time export and runtime diff/pagination/post endpoints emit identical
     <!-- Optional pagination trigger when older replies in this thread are truncated -->
     <!-- <li id="load-older-replies-101" class="load-more-replies">...</li> -->
 
-    <!-- Child reply -->
+    <!-- Child reply (admin example with .badge-admin) -->
     <li id="comment-102" class="comment-reply-item">
       <div class="comment-meta">
-        <strong>Bob</strong>
+        <strong>Kouga</strong><span class="badge-admin" data-i18n="admin-badge">Author</span>
         <time data-ts="1732123500">1732123500</time>
-        <button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget(101, 'Bob')">Reply</button>
+        <button type="button" class="reply-btn" data-i18n="reply" onclick="setReplyTarget(101, 'Kouga')">Reply</button>
       </div>
       <div class="comment-body"><span class="reply-to">@Alice</span> <p>Welcome!</p></div>
     </li>
@@ -192,9 +235,10 @@ Both build-time export and runtime diff/pagination/post endpoints emit identical
 
 | Method | Path | Query / Body Params | Response |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/api/comments/export` | `?slug=/posts/xxx/&limit=20&max_bytes=32768&lang=en` | `200 OK` JSON: `{ "lastCursor", "firstCursor", "hasMore", "exportedCount", "htmlBytes", "html" }` (`Cache-Control: no-store`) |
+| `GET` | `/api/comments/export` | `?slug=/posts/xxx/&limit=20&max_bytes=32768&lang=en` | `200 OK` JSON: `{ "lastCursor", "firstCursor", "hasMore", "exportedCount", "htmlBytes", "bakedAt", "html" }` (`Cache-Control: public, max-age=60`) |
 | `GET` | `/api/comments` | `?slug=...&after=<id>` (delta) / `&before=<id>&limit=20` (older roots) / `&parent_id=<id>&before\|after=<id>` (thread replies), optional `&lang=` | `204 No Content` (idle delta) or `200 OK` `text/html` fragments (OOB replies carry `hx-swap-oob="beforeend:#replies-for-{parent_id}"` + OOB `#reply-count-{parent_id}`) |
-| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `lang?`, `website` (honeypot) | `200 OK` `text/html` single `<li>` item (sets `HX-Retarget` / `HX-Reswap` and OOB reply count if `parent_id` is present) |
+| `POST` | `/api/comments` | Form: `slug`, `author`, `content`, `parent_id?`, `reply_to_author?`, `lang?`, `website` (honeypot) | `200 OK` `text/html` single `<li>` item (`403` reserved admin name, `429` rate limited) |
+| `POST` | `/api/comments/tg-webhook` | Header: `X-Telegram-Bot-Api-Secret-Token`; JSON `Update` from `TELEGRAM_CHAT_ID` | `200 OK` (reply to publish admin comment, `/hide`, `/del`, `/show`, `/post <slug> <content>`) |
 
 ---
 
@@ -301,6 +345,7 @@ Reference `layouts/partials/comments.html` (supports Hugo `i18n`, `hugo.IsServer
 <script>
   var HX_ECHO_I18N = {
     errorGeneric: {{ T "comments_error_generic" }},
+    adminBadge: {{ T "comments_admin_badge" | default "Author" }},
     reply: {{ T "comments_reply" }},
     replyCountOne: {{ T "comments_reply_count" 1 }},
     replyCountOther: {{ T "comments_reply_count" (dict "Count" "__N__") }},
@@ -318,7 +363,9 @@ Reference `layouts/partials/comments.html` (supports Hugo `i18n`, `hugo.IsServer
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
       var key = el.getAttribute('data-i18n');
-      if (key === 'reply') {
+      if (key === 'admin-badge') {
+        el.textContent = HX_ECHO_I18N.adminBadge;
+      } else if (key === 'reply') {
         el.textContent = HX_ECHO_I18N.reply;
       } else if (key === 'reply-count') {
         var c = parseInt(el.getAttribute('data-count'), 10) || 0;
@@ -487,12 +534,11 @@ Reference `layouts/partials/comments.html` (supports Hugo `i18n`, `hugo.IsServer
 ## 7. Implementation Status & Future Extensions
 
 1. **Core Worker & Frontend Integration (Implemented)**:
-   - `/api/comments/export` with item limits and `EXPORT_MAX_BYTES` byte circuit breaker.
-   - `/api/comments` `GET` (delta `after`, root pagination `before`, thread reply pagination `parent_id` + `before`/`after`) and `POST` (honeypot, Markdown + `ammonia`, two-level tree normalization, `HX-Retarget` / `HX-Reswap`, OOB reply count).
-   - Server-side i18n (`en`, `zh-cn`, `zh-tw`, `ja`) + semantic `data-i18n` attributes, `Cache-Control: no-store`, and loopback/configured CORS support.
-   - 10 unit tests covering slug normalization, XSS/JS escaping, export packing, byte circuit breaker, delta/OOB rendering, pagination, CORS loopback validation, and locale parsing.
-2. **Admin & Moderation Extension (Future)**:
-   - Add `ADMIN_TOKEN` secret in Worker env for comment deletion/hiding (`status = 0`).
-   - Optional debounced GitHub `repository_dispatch` webhook via Cloudflare KV/Queues to trigger static rebuilds after new comments settle.
-3. **One-Click Self-Hosting (Future)**:
-   - Provide a GitHub Actions workflow (`deploy.yml`) running `npx wrangler deploy` so forks can deploy without installing Rust locally.
+   - `/api/comments/export` with item limits, `EXPORT_MAX_BYTES` byte circuit breaker, `bakedAt` timestamp, and `Cache-Control: public, max-age=60` edge caching via Cloudflare Cache API.
+   - `/api/comments` `GET` (delta `after`, root pagination `before`, thread reply pagination `parent_id` + `before`/`after`) and `POST` (optional `COMMENT_RATE_LIMITER`, honeypot, `ADMIN_NAMES` protection, Markdown + `ammonia`, two-level tree normalization, `HX-Retarget` / `HX-Reswap`, OOB reply count, async Telegram notification via `ctx.wait_until`).
+   - `/api/comments/tg-webhook` `POST` for Telegram Bot bidirectional moderation and replying (`X-Telegram-Bot-Api-Secret-Token` + `TELEGRAM_CHAT_ID` verification, `/hide`, `/del`, `/show`, reply-to-publish with `.badge-admin`, `/post <slug> <content>`).
+   - Server-side i18n (`en`, `zh-cn`, `zh-tw`, `ja`) + semantic `data-i18n` attributes, `Cache-Control: no-store` on dynamic routes, and loopback/configured CORS support.
+   - D1 versioned migrations (`migrations/0001_init.sql`, `migrations/0002_tg_admin.sql`) and guided GitHub Actions workflow (`.github/workflows/deploy.yml`).
+   - 16 unit tests covering slug normalization, XSS/JS escaping, export packing, byte circuit breaker, delta/OOB rendering, pagination, CORS loopback validation, locale parsing, admin badge rendering, reserved admin names, Telegram commands/tag parsing, HTML-stripped Markdown excerpting, and normalized cache keys.
+2. **Optional Future Extensions**:
+   - Debounced GitHub `repository_dispatch` webhook via Cloudflare Queues to trigger periodic static rebuilds after new comments settle.

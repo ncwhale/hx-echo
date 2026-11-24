@@ -9,6 +9,7 @@ command = "cargo install -q worker-build && worker-build --release"
 binding = "DB"
 database_name = "hx-echo-db"
 database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
 
 # Mount the same Worker across all mirror domains under /api/comments*
 routes = [
@@ -16,8 +17,38 @@ routes = [
   { pattern = "mirror.example.org/api/comments*", zone_name = "mirror.example.org" }
 ]
 
+# Optional edge rate limiting for POST /api/comments (requires Wrangler >= 4.36.0; period must be 10 or 60)
+# Uncomment to enable per-IP rate limiting (when omitted, rate limiting is skipped safely):
+# [[ratelimits]]
+# name = "COMMENT_RATE_LIMITER"
+# namespace_id = "1001"
+#
+#   [ratelimits.simple]
+#   limit = 5
+#   period = 60
+
 [vars]
 DEFAULT_LANG = "en"
 EXPORT_DEFAULT_LIMIT = "20"
 EXPORT_MAX_LIMIT = "100"
 EXPORT_MAX_BYTES = "32768"
+EXPORT_CACHE_MAX_AGE = "60"
+
+# Optional: canonical site origin used in Telegram notification links (no trailing slash)
+# SITE_ORIGIN = "https://example.com"
+
+# Optional: comma-separated reserved author names blocked on public web submissions (403)
+# ADMIN_NAMES = "Admin,YourName"
+
+# Optional: display name used when replying or posting via Telegram Bot (also auto-reserved)
+# ADMIN_DISPLAY_NAME = "Admin"
+
+# Optional: numeric Telegram chat ID authorized to control this Worker via /api/comments/tg-webhook
+# (Can also be stored as a Secret instead of [vars])
+# TELEGRAM_CHAT_ID = "123456789"
+
+# ---------------------------------------------------------------------------
+# Secrets (DO NOT put tokens here; set via `npx wrangler secret put <KEY>`):
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+#   npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+# ---------------------------------------------------------------------------
